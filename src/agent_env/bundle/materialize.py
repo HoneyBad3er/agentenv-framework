@@ -35,6 +35,7 @@ from agent_env.store.routing import namespace_routing_enabled
 from agent_env.task import Task
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_step import TaskStep
+from agent_env.task_step.traversal import walk_step_definitions
 from agent_env.utils.docker.build import DockerBuildError
 
 from ._fs import with_article
@@ -352,8 +353,12 @@ def _preflight(plan: Plan, write: Write, task: Task,
 
 def _reads(step: dict) -> set[tuple[str, str]]:
     """The (store, id) of each entity ``step`` reads."""
-    refs = get_task_step_registry()[step["type"]].entity_refs or ()
-    return {(site.ref.kind.value, site.value) for site in ref_sites(refs, step) if site.ref.role is RefRole.INPUT}
+    return {
+        (site.ref.kind.value, site.value)
+        for location in walk_step_definitions([step], get_task_step_registry())
+        for site in ref_sites(location.step_class.entity_refs or (), location.value)
+        if site.ref.role is RefRole.INPUT
+    }
 
 
 def _key(write: Write) -> tuple[str, str]:

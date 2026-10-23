@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import TYPE_CHECKING, Callable, Optional, Self
 
-from agent_env.store.base import NotFoundError
+from agent_env.store.base import ConcurrentModificationError, NotFoundError
 from agent_env.config import get_config
 from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Lte, Ne, Sort, SortKey, UnknownDocumentTypeError, UpdateSpec, VersionedEntityStore, VersionedEntityStoreCache, compare_and_swap
 from agent_env.store.query import QueryBuilder, to_document_query
@@ -184,6 +184,7 @@ class TaskInstance:
     # carries the epoch it was dispatched under and no-ops when older than the stored one,
     # fencing a writer from a rolled-back attempt. Missing (pre-field docs) reads as 0.
     attempt_epoch: int = 0
+    child_step_generations: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> TaskInstance:
@@ -202,6 +203,7 @@ class TaskInstance:
             completed_steps=[TaskStepResult.from_dict(e) for e in data.get("completed_steps", [])],
             step_attempt_failures=data.get("step_attempt_failures", []),
             attempt_epoch=data.get("attempt_epoch", 0),
+            child_step_generations=dict(data.get("child_step_generations", {})),
         )
 
 
@@ -263,6 +265,7 @@ def _new_instance_doc(
         "created_at_utc": created_at_utc,
         "rev": 0,
         _GENERATION: 0,
+        "child_step_generations": {},
         **run_state,
     }
 
@@ -508,6 +511,34 @@ class TaskInstanceStore:
         retired and not returned. ``generation`` defaults to the instance's current one."""
         return self._journal_entries(self._doc_store, instance_id, generation)
 
+    def replay_completed_context_sync(self, instance_id: str, completed_step_ids: set[str]) -> dict:
+        """Rebuild a resume seed from committed successful steps without retaining a failed step's partial writes."""
+        store = self._doc_store
+        key = Filter.of(instance_id=instance_id)
+        document = store.find_one(TASK_INSTANCES_COLLECTION, key)
+        if document is None:
+            raise NotFoundError(f"TaskInstance {instance_id!r} not found")
+        completed = [entry for entry in document.get("completed_steps", []) if entry["step_id"] in completed_step_ids]
+        successful = {entry["step_id"] for entry in completed if entry["status"] == TaskStepStatus.SUCCESS}
+        if missing := completed_step_ids - successful:
+            raise ValueError(f"instance {instance_id!r} has no successful completion for steps {sorted(missing)}")
+        entries = self._journal_entries(store, instance_id, document.get(_GENERATION, 0))
+        if not any(entry["step_id"] == _SEED_STEP_ID for entry in entries):
+            raise ValueError(f"instance {instance_id!r} has no journal seed; cannot replay completed steps")
+        journaled = {entry["step_id"] for entry in entries if entry["status"] == TaskStepStatus.SUCCESS}
+        if missing := completed_step_ids - journaled:
+            raise ValueError(f"steps {sorted(missing)} of instance {instance_id!r} completed without a successful journal entry")
+        rerecorded = document.get(_RERECORDED)
+        if rerecorded is None:
+            raise ValueError(f"instance {instance_id!r} predates {_RERECORDED}; cannot replay completed steps")
+        retained = [entry for entry in entries if entry["step_id"] == _SEED_STEP_ID or entry["step_id"] in completed_step_ids]
+        replayed = replay_context(commit_ordered(retained, completed), rerecorded)
+        current = store.find_one(TASK_INSTANCES_COLLECTION, key)
+        fields = (_REV, "attempt_epoch", _GENERATION, _JOURNAL_SEQ, "completed_steps", _RERECORDED)
+        if current is None or any(current.get(field) != document.get(field) for field in fields):
+            raise ConcurrentModificationError(f"TaskInstance {instance_id!r} changed while replaying completed steps")
+        return replayed
+
     def _journal_entries(
         self, store: DocumentStore, instance_id: str, generation: int | None,
     ) -> list[dict]:
@@ -606,6 +637,10 @@ class TaskInstanceStore:
                 "completed_steps": completed,
                 "current_step": len(completed),
                 _RERECORDED: rerecords,
+                "child_step_generations": {
+                    **doc.get("child_step_generations", {}),
+                    **{step_id: doc.get("child_step_generations", {}).get(step_id, 0) + 1 for step_id in step_ids},
+                },
             }
             if bump_epoch:
                 fields["attempt_epoch"] = doc.get("attempt_epoch", 0) + 1

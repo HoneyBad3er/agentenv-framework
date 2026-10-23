@@ -157,4 +157,5 @@ UNAFFECTED = frozenset({
     "agent_prompt_response_verifier", "verify_mcp_env_assessment",
     # It skips an agent that isn't deployed.
     "teardown_sandboxes",
+    "subdag", "repeat_until",
 })

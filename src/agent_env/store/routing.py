@@ -58,7 +58,7 @@ from agent_env.store.object_store.object_store import (
 )
 
 # The fields a run-time document names its owner by: one holding an @local id places it locally.
-_OWNER_FIELDS = ("id", "instance_id", "task_id", "task_instance_id", "env_id", "agent_id")
+_OWNER_FIELDS = ("id", "instance_id", "task_id", "task_instance_id", "parent_instance_id", "child_instance_id", "env_id", "agent_id")
 _LOCAL_REPOSITORY_PREFIX = f"{LOCAL_NAMESPACE}/"
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
 _T = TypeVar("_T")
@@ -214,11 +214,11 @@ def _filter_owner(filter: Filter) -> dict:
     return {path: preds[0].value for path, preds in filter.conditions.items() if len(preds) == 1 and isinstance(preds[0], Eq)}
 
 
-def _filter_is_local(filter: Filter) -> Optional[bool]:
+def _filter_is_local(filter: Filter, *, field: str = "id") -> Optional[bool]:
     """Whether the ids a filter pins are all ``@local`` (True) or all bare (False); None when it pins
     none, or both kinds."""
     values: list[Any] = []
-    for pred in filter.conditions.get("id", ()):
+    for pred in filter.conditions.get(field, ()):
         if isinstance(pred, Eq):
             values.append(pred.value)
         elif isinstance(pred, In):
@@ -460,7 +460,7 @@ class RoutingDocumentStore(DocumentStore):
 
     def _placed(self, collection: str, filter: Filter) -> Optional[DocumentStore]:
         if not is_entity_collection(collection):
-            return None
+            return self.local if any(_filter_is_local(filter, field=field) is True for field in _OWNER_FIELDS) else None
         local = _filter_is_local(filter)
         return None if local is None else self.local if local else self.configured
 

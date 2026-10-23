@@ -76,8 +76,12 @@ def _builtin_registry() -> dict[str, type["TaskStep"]]:
     from agent_env.task_step.task_steps.verifiers.aggregate_verifiers import AggregateVerifiersTaskStep
     from agent_env.task_step.task_steps.run_code import RunCodeTaskStep
     from agent_env.task_step.task_steps.review import ReviewTaskStep
+    from agent_env.task_step.task_steps.subdag import SubDAGTaskStep
+    from agent_env.task_step.task_steps.repeat_until import RepeatUntilTaskStep
 
     return {
+        _get_type(SubDAGTaskStep): SubDAGTaskStep,
+        _get_type(RepeatUntilTaskStep): RepeatUntilTaskStep,
         _get_type(ReviewTaskStep): ReviewTaskStep,
         _get_type(BuildMcpCliTaskStep): BuildMcpCliTaskStep,
         _get_type(CollectArtifactsTaskStep): CollectArtifactsTaskStep,

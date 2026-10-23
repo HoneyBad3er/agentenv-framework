@@ -210,6 +210,25 @@ orchestrators call it the same way. What callers rely on:
   references it did not create.
 - A run is resumable: pass a previously persisted `context`, a `start_step` and the existing
   `instance_id`; completed steps are seeded as SUCCESS.
+- `completed_step_ids` resumes a DAG with completed independent branches: the named steps must
+  belong to the active graph and include their dependencies. Their effects must already be in
+  the supplied context.
+- `subdag` embeds a task definition with explicit metadata `input_bindings` and `output_bindings`.
+  `repeat_until` adds `max_iterations`, a type-strict JSON `until_key` / `until_value` comparison
+  and `feedback_bindings` between iterations. Both require positive `child_timeout_seconds` and
+  `cleanup_timeout_seconds`. Embedded task fields are declared by `TaskStep.embedded_task_fields`
+  so bundle references and preflight checks retain each child graph's scope.
+- Child runs have isolated contexts and durable links in `task_child_invocations`, keyed by parent
+  instance, parent step, logical step generation and iteration. A parent resume reuses its child;
+  rolling back that step advances its generation and creates a fresh child. The ledger pins the
+  child definition and captured inputs. Successful children are reused across the gap before the
+  parent records completion. Incomplete resource-free children resume their successful branches;
+  incomplete resource-bearing children are cleaned and restart their graph. External effects of an
+  interrupted step still require the step's own idempotency.
+- Nested steps own child teardown and propagate cancellation. An unconfirmed teardown raises a
+  `TaskLifecycleError`, which remains fatal through cancellation and overrides step tolerance and
+  retries. Metadata bindings cannot export live resources or framework execution settings. Child
+  instances and links are recorded; the explorer does not render a nested run tree.
 - A runner that must hear from a long step puts a zero-argument callable at
   `context.metadata[HEARTBEAT_KEY]` (`task_step/context.py`); a step that blocks for long calls
   `context.heartbeat()`, a no-op without one. The key is in `_REDACTED_KEYS`, so it is never persisted.

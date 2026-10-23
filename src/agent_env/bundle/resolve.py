@@ -12,7 +12,7 @@ import copy
 import functools
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from agent_env.store.ids import LOCAL_PREFIX, derive_id, validate_local_id
 from agent_env.store.image_store.oci_registry_credentials import names_registry
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_step import TaskStep, attach_retry_config, dependencies
+from agent_env.task_step.traversal import embedded_tasks
 
 from ._fs import fold, relative, show
 from .authoring import AuthoringContext, default_dockerfile
@@ -200,12 +201,12 @@ class _Resolver:
         outputs = self._outputs(entry, declared)
         edges = _step_edges(steps, self._depends_on(entry, steps))
         references: list[Reference] = []
+        child_outputs: list[Output] = []
         for index, step, cls in declared:
             where = f"step {step.get('id')!r}: "
             if cls.entity_refs is None:
                 self._undeclared(entry, step, cls, outputs, where)
-                continue
-            for site in ref_sites(cls.entity_refs, step):
+            for site in ref_sites(cls.entity_refs or (), step):
                 if site.ref.role is RefRole.OUTPUT:
                     continue
                 if not (isinstance(site.value, str) and site.value):
@@ -213,7 +214,18 @@ class _Resolver:
                     continue
                 self._resolve(entry, site, f"{where}{site.path}", site.value, site.version, outputs,
                               functools.partial(_upstream, edges, index), references)
-        return ResolvedEntry(entry, steps, tuple(references), tuple(outputs.values()))
+            try:
+                children = list(embedded_tasks(step, cls))
+            except ValueError as error:
+                self._problem(entry, f"{where}{error}")
+                continue
+            for field_name, definition in children:
+                child_entry = replace(entry, id=f"{entry.id}/{step['id']}/{field_name}", config=definition["steps"])
+                child = self._task(child_entry)
+                definition["steps"] = child.config
+                references.extend(replace(ref, where=f"{where}{field_name}: {ref.where}") for ref in child.references)
+                child_outputs.extend(child.outputs)
+        return ResolvedEntry(entry, steps, tuple(references), (*outputs.values(), *child_outputs))
 
     def _image_folder(self, entry: BundleEntry) -> bool:
         """Record the image a docker_image artifact folder is: built from its Dockerfile, or the registry image its

@@ -91,6 +91,7 @@ class TaskStep(ABC):
     DEFAULT_AGENT_NAME: ClassVar[str] = "default-agent"
     # Fields holding env, A2A agent or artifact ids; None means undeclared.
     entity_refs: ClassVar[tuple[EntityRef, ...] | None] = None
+    embedded_task_fields: ClassVar[tuple[str, ...]] = ()
     # Each field of a scope other than the task's, by its path in the stored step; any other field is task-scoped. A
     # subclass merges its parent's. Such a field is optional, so a step written out without it still builds and runs.
     field_scopes: ClassVar[Mapping[str, FieldScope]] = {"metadata.attribution": FieldScope.USER}

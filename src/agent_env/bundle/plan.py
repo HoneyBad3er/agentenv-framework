@@ -54,6 +54,7 @@ from agent_env.store.routing import namespace_routing_enabled
 from agent_env.task import Task
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_step import TaskStep
+from agent_env.task_step.traversal import walk_step_definitions
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.install_agent import InstallAgentTaskStep
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
@@ -263,12 +264,12 @@ class _Planner:
         check."""
         registry = get_task_step_registry()
         found = []
-        for step in task.config:
-            cls = registry.get(step.get("type")) if isinstance(step.get("type"), str) else None
+        for location in walk_step_definitions(task.config, registry):
+            step, cls = location.value, location.step_class
             for field_ref in default_agent_refs(cls.entity_refs or () if cls is not None else (), step):
                 version = step.get(field_ref.version_field) if field_ref.version_field else None
                 ref = Reference(EntityKind.AGENT, agent_id or get_config().get_default_a2a_agent_id(), version, None,
-                                f"step {step.get('id')!r}: {field_ref.path} (the default agent)", None)
+                                f"{location.label}: {field_ref.path} (the default agent)", None)
                 pulled = self._pulled(ref)
                 if pulled.local is not None or (ref.kind, ref.id, ref.version) in self.unpulled:
                     found.append(pulled)
@@ -744,14 +745,17 @@ class _Planner:
                 if isinstance(source, ResolvedEntry) and source.entry.kind is BundleKind.ARTIFACT
                 and issubclass(registry.get(canonical_type(source.entry.type)) or object, CliArtifact)}
         for key in sorted(closure, key=self.rank.__getitem__):
-            installed: dict[tuple[str, str], tuple[Any, str]] = {}
-            for step in self.steps.get(key, ()):
-                if not isinstance(step, LoadArtifactTaskStep):
+            installed: dict[tuple[str, str, str], tuple[Any, str]] = {}
+            configs = [step.to_dict() for step in self.steps.get(key, ())]
+            for location in walk_step_definitions(configs, get_task_step_registry()):
+                cls = location.step_class
+                if cls is None or not issubclass(cls, LoadArtifactTaskStep):
                     continue
+                step = cls.from_dict(location.value)
                 loaded = [clis[ref["id"]] for ref in step.artifacts if ref.get("id") in clis]
                 if not loaded:
                     continue
-                where = f"{self._path(self.nodes[key].entry)}: step {step.id!r}"
+                where = f"{self._path(self.nodes[key].entry)}: {location.label}"
                 if missing := [name for name in ("agent_name", "env_id") if not getattr(step, name)]:
                     names, it = " and ".join(repr(cli.name) for cli in loaded), "them" if len(loaded) > 1 else "it"
                     self.problems.append(f"{where}: loading the CLI{'s' * (it == 'them')} {names} installs {it} into "
@@ -762,13 +766,14 @@ class _Planner:
                     command = self.accepted.get(_key(cli), {}).get("command_name")
                     if command is None:
                         continue  # its artifact.toml's problem is reported by the file check
-                    if (step.agent_name, command) in installed:
-                        first, name = installed[step.agent_name, command]
+                    installed_key = (location.task_path, step.agent_name, command)
+                    if installed_key in installed:
+                        first, name = installed[installed_key]
                         self.problems.append(f"{where}: installs the CLI {cli.name!r} as {command!r} in agent "
                                              f"{step.agent_name!r}, where step {first!r} already installed {name!r} "
                                              "under that command; give one another command_name")
                     else:
-                        installed[step.agent_name, command] = (step.id, cli.name)
+                        installed[installed_key] = (step.id, cli.name)
 
     def _env_accept(self, entry: BundleEntry) -> Any:
         """How ``entry``'s env type checks its env.toml, when it's an env written from one and checks it at all."""
@@ -871,12 +876,12 @@ class _Planner:
             if not (isinstance(source, ResolvedEntry) and source.entry.kind is BundleKind.TASK):
                 continue
             loads: dict[str, list[Reference]] = {}  # each load_artifact step's references, by the step's label
-            for step in source.config:
-                cls = registry.get(step["type"]) if isinstance(step.get("type"), str) else None
+            for location in walk_step_definitions(source.config, registry):
+                cls = location.step_class
                 if cls is not None and issubclass(cls, LoadArtifactTaskStep):
-                    loads[f"step {step.get('id')!r}"] = []
+                    loads[location.label] = []
             for ref in source.references:
-                label = ref.where.partition(": ")[0]
+                label = ref.where.rpartition(": ")[0]
                 if label in loads:
                     loads[label].append(ref)
             for label, refs in loads.items():
@@ -1069,8 +1074,8 @@ def solver_steps(steps: Any) -> tuple[str, ...]:
 def _leaves_an_agent_unset(task: ResolvedEntry) -> bool:
     """Whether a step of ``task`` leaves an agent field unset, so deploys the configured default agent."""
     registry = get_task_step_registry()
-    for step in task.config:
-        cls = registry.get(step.get("type")) if isinstance(step.get("type"), str) else None
+    for location in walk_step_definitions(task.config, registry):
+        step, cls = location.value, location.step_class
         if any(default_agent_refs(cls.entity_refs or () if cls is not None else (), step)):
             return True
     return False
@@ -1082,8 +1087,8 @@ def _renamed(steps: Any, ids: Mapping[str, str]) -> Any:
         return steps
     steps = copy.deepcopy(steps)
     registry = get_task_step_registry()
-    for step in steps:
-        cls = registry.get(step.get("type")) if isinstance(step.get("type"), str) else None
+    for location in walk_step_definitions(steps, registry):
+        step, cls = location.value, location.step_class
         for site in ref_sites(cls.entity_refs or () if cls is not None else (), step):
             if site.ref.kind is EntityKind.AGENT and site.ref.role is RefRole.INPUT and site.value in ids:
                 site.rewrite(ids[site.value])

@@ -69,6 +69,7 @@ from agent_env.providers.sandbox_providers.sandbox_provider import (
     get_sandbox_provider,
 )
 from agent_env.store.base import NotFoundError
+from agent_env.task_step.traversal import embedded_tasks
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep, linked_sandbox_problem
 from agent_env.task_step.task_steps.install_agent import InstallAgentTaskStep
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
@@ -145,11 +146,14 @@ class _Walk:
         self.uses: dict[str, list[tuple[str, str, list[SandboxProvider], Callable[[SandboxProvider], Accepts]]]] = {}
 
     def task(self, task: ResolvedEntry) -> None:
-        steps = [build_step(config) for config in task.config]
-        sandboxes = {step.sandbox_name: step for step in steps if isinstance(step, DeploySandboxTaskStep)}
         solver = self.plan.agent.steps.get(task.entry.id, ()) if self.plan.agent else ()
-        for step in steps:
-            where = f"{self.plan.path(task.entry)}: step {step.id!r}"
+        self._task_steps(task.config, self.plan.path(task.entry), solver)
+
+    def _task_steps(self, configs: list[dict], task_where: str, solver: tuple[str, ...]) -> None:
+        steps = [build_step(config) for config in configs]
+        sandboxes = {step.sandbox_name: step for step in steps if isinstance(step, DeploySandboxTaskStep)}
+        for config, step in zip(configs, steps):
+            where = f"{task_where}: step {step.id!r}"
             override = self.plan.agent if step.id in solver else None
             try:
                 if isinstance(step, DeployEnvTaskStep):
@@ -164,6 +168,8 @@ class _Walk:
                     self.default_agent_users.append((where, "names no agent"))
             except ValueError as e:  # a provider that names no backend, or can't be built from its config
                 self._problem(where, str(e))
+            for field, definition in embedded_tasks(config, type(step)):
+                self._task_steps(definition["steps"], f"{where}: {field}", ())
 
     def finish(self) -> Preflight:
         infra: list[InfraSetup] = []

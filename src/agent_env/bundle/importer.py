@@ -66,6 +66,7 @@ from agent_env.store.ids import LOCAL_PREFIX
 from agent_env.store.image_store.oci_registry_credentials import names_registry
 from agent_env.task import Task
 from agent_env.task_step import registry as task_step_registry
+from agent_env.task_step.traversal import walk_step_definitions
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.utils.paths import os_reason
 
@@ -192,10 +193,12 @@ class _Importer:
         steps = task.to_dict()["steps"]
         registry = get_task_step_registry()
         found = []
-        for step in steps:
-            cls = registry[step["type"]]
+        for location in walk_step_definitions(steps, registry):
+            step, cls = location.value, location.step_class
+            if cls is None:
+                raise ValueError(f"{location.path}: unknown task step type {step.get('type')!r}")
             pruned = prune(step, cls.field_scopes, self.include_scopes)  # first, so no pruned field is written
-            found.append((step, cls, pruned, [site for site in ref_sites(cls.entity_refs or (), step)
+            found.append((location.label, step, cls, pruned, [site for site in ref_sites(cls.entity_refs or (), step)
                                               if isinstance(site.value, str) and site.value]))
         sites = [site for *_, step_sites in found for site in step_sites]
         outputs = _output_names(sites)
@@ -206,8 +209,8 @@ class _Importer:
         for site in sites:
             if site.ref.kind is EntityKind.ENV and site.version is not None:
                 pins.setdefault(_key(site)[1], set()).add(site.version)
-        for step, cls, pruned, step_sites in found:
-            where = f"{path}: step {step.get('id')!r}"
+        for label, step, cls, pruned, step_sites in found:
+            where = f"{path}: {label}"
             self.dropped += [Dropped(f"{where}: {at}", why) for at, why in pruned + scrub(step)]
             self._need(where, "step type", TASK_STEPS, cls.type, cls)
             if cls.entity_refs is None:

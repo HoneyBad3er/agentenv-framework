@@ -19,6 +19,7 @@ from agent_env.config import run_env_ids
 from agent_env.plugins import _registration
 from agent_env.store.document_store import UnknownDocumentTypeError
 from agent_env.store.routing import run_scope
+from agent_env.task.execution import StepExecution, TaskLifecycleError, executing_step
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
 from agent_env.task_step.task_step import RetryConfig, TaskStep
@@ -416,6 +417,8 @@ class Task:
         end_step: int | None = None,
         context: TaskStepContext | None = None,
         instance_id: str | None = None,
+        *,
+        completed_step_ids: set[str] | None = None,
     ) -> TaskStepContext:
         """Run steps per their depends_on DAG. Per-step `fail_task_on_error`
         (default True) controls halt-on-failure; failures land in
@@ -425,7 +428,7 @@ class Task:
         with run_scope(self.id), run_env_ids((context.metadata.get("user_overrides") or {}) if context else {}):
             return await self._run(
                 on_step_start, on_step_complete, agent_model, agent_artifact_id,
-                start_step, end_step, context, instance_id,
+                start_step, end_step, context, instance_id, completed_step_ids,
             )
 
     async def _run(
@@ -438,10 +441,12 @@ class Task:
         end_step: int | None,
         context: TaskStepContext | None,
         instance_id: str | None,
+        completed_step_ids: set[str] | None,
     ) -> TaskStepContext:
         from .store import (
             TaskStepResult,
             TaskStepStatus,
+            record_step_complete,
             register_task_instance,
             seed_task_instance_context,
         )
@@ -474,11 +479,12 @@ class Task:
             raise ValueError(f"start_step={start_step} out of range [0, {len(steps)})")
         if end_step is not None and (end_step <= start_step or end_step > len(steps)):
             raise ValueError(f"end_step={end_step} out of range ({start_step}, {len(steps)}]")
+        state = self._build_scheduler_state(steps, start_step, end_step, completed_step_ids=completed_step_ids)
         if agent_model is not None:
             context.agent_model = agent_model
         if agent_artifact_id is not None:
             context.agent_artifact_id = agent_artifact_id
-        rerun = {step.id for step in steps[start_step:end_step]}
+        rerun = {step.id for step in steps[start_step:end_step]} - state.completed
         if context.metadata.get("failed_steps"):
             context.metadata["failed_steps"] = [
                 f for f in context.metadata["failed_steps"] if not (isinstance(f, dict) and f.get("step_id") in rerun)]
@@ -495,7 +501,7 @@ class Task:
         total = len(steps)
         completed_steps = [
             TaskStepResult(step_id=step.id, status=TaskStepStatus.SUCCESS)
-            for step in steps[:start_step]
+            for step in steps if step.id in state.completed
         ]
         instance = register_task_instance(
             self.id,
@@ -510,9 +516,13 @@ class Task:
         if instance_id:
             seed_task_instance_context(instance_id, context)
 
-        state = self._build_scheduler_state(steps, start_step, end_step)
         if instance:
             state.epoch = instance.attempt_epoch
+        if instance_id and len(state.completed) == len(steps):
+            await record_step_complete(
+                instance_id, steps[-1].id, ContextUpdateOps(), total, self._utc_now_str(),
+                attempt_epoch=state.epoch,
+            )
         # _drive_dag drains in-flight steps and records the failure itself if it raises.
         first_error, first_error_step_id = await self._drive_dag(
             steps, state, total, context, instance_id,
@@ -608,12 +618,13 @@ class Task:
             started_mono = time.monotonic()
             started_utc = datetime.now(timezone.utc).isoformat()
             try:
-                await step.execute(context)
+                with executing_step(StepExecution(instance_id=instance_id, step_id=step.id, attempt_epoch=dispatch_epoch)):
+                    await step.execute(context)
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
                 duration = time.monotonic() - started_mono
-                fatal = getattr(step, "fail_task_on_error", True)
+                fatal = isinstance(exc, TaskLifecycleError) or getattr(step, "fail_task_on_error", True)
                 context.metadata.setdefault("failed_steps", []).append({
                     "step_id": step.id, "step_type": step.type,
                     "error": str(exc), "error_type": type(exc).__name__,
@@ -634,22 +645,37 @@ class Task:
                 if inspect.isawaitable(result):
                     await result
 
-        async def _drain_in_flight() -> set[str]:
+        async def _drain_in_flight(*, propagate_cancellation: bool = True) -> set[str]:
             """Cancel and await every in-flight step; return the ids cancelled.
 
             A sibling cancelled mid-execute may hold partial context writes, so the
             caller rolls those ids back too. Cancellation cannot interrupt an
             in-flight persist; the epoch fence, not the cancel, stops a drained
             step's late write."""
+            nonlocal first_error, first_error_step_id
+            pending_steps = list(in_flight.items())
             cancelled = set(in_flight)
             tick = next(clock)
             for sid in cancelled:
                 ended[sid] = tick
             for t in list(in_flight.values()):
                 t.cancel()
-            await asyncio.gather(*in_flight.values(), return_exceptions=True)
+            draining = asyncio.gather(*(task for _, task in pending_steps), return_exceptions=True)
+            interrupted = False
+            while not draining.done():
+                try:
+                    await asyncio.shield(draining)
+                except asyncio.CancelledError:
+                    interrupted = True
+            results = draining.result()
             in_flight.clear()
             task_to_step_id.clear()
+            for (step_id, _), result in zip(pending_steps, results):
+                if isinstance(result, TaskLifecycleError):
+                    first_error, first_error_step_id = result, step_id
+                    raise result
+            if interrupted and propagate_cancellation:
+                raise asyncio.CancelledError
             return cancelled
 
         try:
@@ -678,10 +704,10 @@ class Task:
                         _unblock_dependents(step_id)
                         continue
                     step_obj = state.step_by_id[step_id]
-                    if isinstance(exc, _store.SupersededAttemptError):
+                    if isinstance(exc, (_store.SupersededAttemptError, TaskLifecycleError)):
                         # A later attempt owns the instance: no retry or tolerance makes this run's writes land.
                         logger.error("%sStep %s failed (superseded): %s", log_prefix, step_id, exc)
-                        if first_error is None:
+                        if first_error is None or isinstance(exc, TaskLifecycleError):
                             first_error, first_error_step_id = exc, step_id
                         continue
                     retry_cfg = getattr(step_obj, "retry_config", None)
@@ -700,7 +726,8 @@ class Task:
                         first_error, first_error_step_id = exc, step_id
 
                 if first_error is not None:
-                    continue  # a terminal fatal wins; the loop drains what's left
+                    await _drain_in_flight()
+                    break
                 if len(retryable) > 1:
                     # Two overlapping or independent spans can't be rebuilt in one
                     # pass (a non-rolled-back loser would silently re-run on a dirty
@@ -733,10 +760,14 @@ class Task:
                             state.completed.discard(sid)
                         _rearm()
         except (asyncio.CancelledError, Exception) as exc:
-            await _drain_in_flight()
-            if instance_id and first_error is None and isinstance(exc, asyncio.CancelledError):
+            failure = exc
+            try:
+                await _drain_in_flight(propagate_cancellation=False)
+            except TaskLifecycleError as cleanup_error:
+                failure = cleanup_error
+            if instance_id and first_error is None and isinstance(failure, asyncio.CancelledError):
                 await asyncio.to_thread(
-                    _store.record_task_cancelled, instance_id, str(exc) or "cancelled", Task._utc_now_str(), state.epoch,
+                    _store.record_task_cancelled, instance_id, str(failure) or "cancelled", Task._utc_now_str(), state.epoch,
                 )
             elif instance_id:
                 # Record with the fatal step's attribution: a cancellation landing
@@ -744,16 +775,25 @@ class Task:
                 # with the CancelledError and a null failing-step id.
                 await _store.record_task_failure(
                     instance_id, first_error_step_id, context,
-                    first_error if first_error is not None else exc, Task._utc_now_str(), state.epoch,
+                    first_error if first_error is not None else failure, Task._utc_now_str(), state.epoch,
                 )
+            if failure is not exc:
+                raise failure from exc
             raise
 
         return first_error, first_error_step_id
 
-    def _build_scheduler_state(self, steps: list, start_step: int, end_step: int | None = None) -> _SchedulerState:
+    def _build_scheduler_state(
+        self, steps: list, start_step: int, end_step: int | None = None,
+        *, completed_step_ids: set[str] | None = None,
+    ) -> _SchedulerState:
         # Truncate steps at end_step (exclusive); depends_on only ever points at
         # earlier steps, so active steps never reference truncated ones.
         active_steps = steps[:end_step] if end_step is not None else steps
+        if completed_step_ids is not None and (
+            not isinstance(completed_step_ids, set) or any(not isinstance(step_id, str) for step_id in completed_step_ids)
+        ):
+            raise ValueError("completed_step_ids must be a set of step ids")
         step_by_id = {s.id: s for s in active_steps}
         dependencies: dict[str, set[str]] = {}
         dependents: dict[str, list[str]] = {step_id: [] for step_id in step_by_id}
@@ -775,15 +815,20 @@ class Task:
             pending[step.id] = len(dependency_step_ids)
             previous_step_id = step.id
 
-        completed: set[str] = set()
-        for s in active_steps[:start_step]:
-            completed.add(s.id)
-            for dependent_step_id in dependents[s.id]:
+        completed = {s.id for s in active_steps[:start_step]} | set(completed_step_ids or ())
+        unknown = completed - step_by_id.keys()
+        if unknown:
+            raise ValueError(f"completed_step_ids names steps outside the active task: {sorted(unknown)}")
+        for step_id in completed:
+            missing = dependencies[step_id] - completed
+            if missing:
+                raise ValueError(f"Completed step {step_id!r} has unfinished dependencies: {sorted(missing)}")
+            for dependent_step_id in dependents[step_id]:
                 pending[dependent_step_id] = max(0, pending[dependent_step_id] - 1)
 
         ready: list[TaskStep] = [
             s for i, s in enumerate(active_steps)
-            if i >= start_step and pending[s.id] == 0
+            if s.id not in completed and pending[s.id] == 0
         ]
         return _SchedulerState(
             step_by_id=step_by_id,
