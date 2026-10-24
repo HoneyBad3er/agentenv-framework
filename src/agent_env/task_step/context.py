@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_env.config.loader import ENV_REF_PREFIX, SECRET_REF_PREFIX
+from agent_env.task_step.resource_tracking import checkpoint_resources
 from agent_env.env.env import DeployedEnv
 from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, host_url_for
 from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url
@@ -228,6 +229,10 @@ class TaskStepContext:
     agent_artifact_id: str | None = None
     agent_harness: str | None = None
     instance_id: str | None = None
+
+    async def checkpoint_resources(self) -> None:
+        """Record resources as soon as their provider identity is known, before another await."""
+        await checkpoint_resources(self)
 
     def to_dict(self) -> dict[str, Any]:
         """The stored form: ``asdict``, with each prompt response's legacy keys (``PromptResponse.to_dict``)."""

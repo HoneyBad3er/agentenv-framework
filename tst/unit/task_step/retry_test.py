@@ -968,8 +968,10 @@ class _Gated:
     def __init__(self, id: str, gate: asyncio.Event, fails: bool = False):
         self.id, self.depends_on, self.retry_config, self.fail_task_on_error = id, None, None, True
         self._gate, self._fails = gate, fails
+        self.executions = 0
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        self.executions += 1
         await self._gate.wait()
         if self._fails:
             raise RuntimeError("superseded boom")
@@ -980,14 +982,16 @@ class _Gated:
 @pytest.mark.asyncio
 async def test_an_attempt_a_re_register_superseded_writes_nothing_to_the_run(store):
     gate = asyncio.Event()
-    task = Task(id="t", version=1, steps=[_Gated("s0", gate), _Gated("s1", gate, fails=True)])
+    steps = [_Gated("s0", gate), _Gated("s1", gate, fails=True)]
+    task = Task(id="t", version=1, steps=steps)
     superseded = asyncio.create_task(task.run(instance_id="i"))
     while _doc(store, "i") is None:
         await asyncio.sleep(0)
     store.upsert_instance("i", "t", 1, 2)
     gate.set()
-    with pytest.raises(SupersededAttemptError, match="'s0'"):   # stops at its first refused write; s1 never runs
+    with pytest.raises(SupersededAttemptError, match="'__seed__'"):
         await superseded
+    assert [step.executions for step in steps] == [0, 0]
     d = _doc(store, "i")
     assert (d["status"], d["completed_steps"], d["context"]["metadata"]) == ("running", [], {})
 
@@ -995,20 +999,21 @@ async def test_an_attempt_a_re_register_superseded_writes_nothing_to_the_run(sto
 @pytest.mark.parametrize("leniency", ["tolerant", "retrying"])
 @pytest.mark.asyncio
 async def test_a_superseded_run_stops_even_at_a_step_that_tolerates_or_retries_failure(store, leniency):
-    # Neither tolerating the step nor rolling it back can make this run's writes land, so s1 must not run.
     gate = asyncio.Event()
     s0 = _Gated("s0", gate)
     if leniency == "tolerant":
         s0.fail_task_on_error = False
     else:
         s0.retry_config = RetryConfig(retry_from_step_id="s0")
-    superseded = asyncio.create_task(Task(id="t", version=1, steps=[s0, _Gated("s1", gate, fails=True)]).run(instance_id="i"))
+    s1 = _Gated("s1", gate, fails=True)
+    superseded = asyncio.create_task(Task(id="t", version=1, steps=[s0, s1]).run(instance_id="i"))
     while _doc(store, "i") is None:
         await asyncio.sleep(0)
     store.upsert_instance("i", "t", 1, 2)
     gate.set()
-    with pytest.raises(SupersededAttemptError, match="'s0'"):   # not s1's "superseded boom": s1 never ran
+    with pytest.raises(SupersededAttemptError, match="'__seed__'"):
         await superseded
+    assert (s0.executions, s1.executions) == (0, 0)
     d = _doc(store, "i")
     assert (d["status"], d["completed_steps"], d["context"]["metadata"]) == ("running", [], {})
 

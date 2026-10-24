@@ -26,12 +26,13 @@ from agent_env.providers.sandbox_providers.sandbox_provider import (
 )
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
+from agent_env.task_step.resource_tracking import TORN_DOWN_RESOURCE_KEY
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5
 
-TORN_DOWN_KEY = "torn_down_sandbox_ids"
+TORN_DOWN_KEY = TORN_DOWN_RESOURCE_KEY
 
 
 class TeardownSandboxesTaskStep(TaskStep):

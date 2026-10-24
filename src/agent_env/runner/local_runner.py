@@ -17,12 +17,18 @@ import os
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Optional
 
 from agent_env.runner import store as run_store
 from agent_env.runner.runner import KEEP_KEY, RunHandle, RunRecord, Runner, RunStatus, run_outcome
-from agent_env.task.store import new_instance_id
+from agent_env.store.base import NotFoundError
+from agent_env.store.routing import run_scope
+from agent_env.task.execution import TaskLifecycleError
+from agent_env.task.persistence import call_store
+from agent_env.task.store import get_task_instance_store, new_instance_id
 from agent_env.task.teardown import TERMINATE_TIMEOUT_SECONDS, teardown_run
+from agent_env.task_step.context import TaskStepContext
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +70,7 @@ class LocalRunner(Runner):
         CLI following its runs, is left to it. There is no queue to resume."""
         run_store.ensure_indexes()
         self._reconciles = True
-        self._reconcile()
+        await self._reconcile()
         self._watching()
 
     def _watching(self) -> None:
@@ -78,20 +84,44 @@ class LocalRunner(Runner):
                 for run_id in list(self._inflight):
                     run_store.see(run_id)
                 if self._reconciles:
-                    self._reconcile()
+                    await self._reconcile()
             except Exception:
                 logger.warning("Couldn't mark runs seen or reconcile orphans; trying again in %ss",
                                self.OWNER_SEEN_SECONDS, exc_info=True)
 
-    def _reconcile(self) -> None:
+    async def _reconcile(self) -> None:
         orphaned = 0
-        for record in run_store.active_runs(self.type):
+        deadline = asyncio.get_running_loop().time() + self.TEARDOWN_WAIT_SECONDS
+        records = await call_store(partial(run_store.active_runs, self.type), deadline=deadline)
+        for record in records:
             if _owner_alive(record.owner):
                 continue
-            run_store.mark_terminal(record.run_id, RunStatus.FAILED, error="interrupted by a hub restart")
+            try:
+                await self._recover_orphan(record)
+            except Exception:
+                logger.warning("Run %s: orphan resources remain pending recovery", record.run_id, exc_info=True)
+                continue
+            await call_store(partial(
+                run_store.mark_terminal, record.run_id, RunStatus.FAILED, error="interrupted by a hub restart",
+            ), deadline=asyncio.get_running_loop().time() + self.TEARDOWN_WAIT_SECONDS)
             orphaned += 1
         if orphaned:
             logger.info("Failed %d run(s) left non-terminal by a previous process", orphaned)
+
+    async def _recover_orphan(self, record: RunRecord) -> None:
+        deadline = asyncio.get_running_loop().time() + self.TEARDOWN_WAIT_SECONDS
+        with run_scope(record.task_id):
+            try:
+                instance = await call_store(partial(get_task_instance_store().get, record.instance_id), deadline=deadline)
+            except NotFoundError:
+                context = TaskStepContext(instance_id=record.instance_id)
+            else:
+                context = TaskStepContext.from_dict(instance.context or {})
+                context.instance_id = record.instance_id
+            async with asyncio.timeout_at(deadline):
+                report = await teardown_run(context, timeout=self.TEARDOWN_WAIT_SECONDS)
+            if report.still_up:
+                raise TaskLifecycleError(f"Run {record.run_id}: orphan resources remain after teardown")
 
     async def stop(self) -> None:
         """Cancel the runs still working and wait for every run, letting a teardown under way finish: each bounds

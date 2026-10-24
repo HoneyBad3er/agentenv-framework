@@ -177,13 +177,14 @@ class DeployEnvTaskStep(TaskStep):
         if self.artifact_version is not None and ("artifact_version" in params or accepts_kwargs):
             deploy_kwargs["artifact_version"] = self.artifact_version
         deployed_env = await env.deploy(**deploy_kwargs)
+        context.deployed_envs.append(deployed_env)
+        await context.checkpoint_resources()
         # create_instance runs inside env.deploy(), so an annotation set after it
         # returns has to be persisted explicitly to reach the instance record.
         annotations = {"deploy_step_id": self.id}
         deployed_env.metadata = {**(deployed_env.metadata or {}), **annotations}
         if deployed_env.instance_id:
             update_env_instance_metadata(deployed_env.instance_id, annotations)
-        context.deployed_envs.append(deployed_env)
 
         # Some envs (e.g. harbor coding tasks) build + run the agent as part of
         # deploy() and have no separate DeployAgent step. They advertise the
@@ -206,4 +207,5 @@ class DeployEnvTaskStep(TaskStep):
                 a2a_card=agent_info.get("a2a_card"),
                 instance_id=agent_info.get("instance_id") or deployed_env.instance_id,
             ))
+            await context.checkpoint_resources()
         return context

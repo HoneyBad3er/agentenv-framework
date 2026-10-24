@@ -340,6 +340,7 @@ class InstallAgentTaskStep(TaskStep):
             instance_id=deployed.instance_id,
             on_host=host_mode,
         ))
+        await context.checkpoint_resources()
 
         default_model = agent.metadata.get("default_model") or get_config().get_model_for_role("agent")
         if default_model and not context.default_agent_model:

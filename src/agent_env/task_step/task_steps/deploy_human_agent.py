@@ -74,6 +74,7 @@ class DeployHumanAgentTaskStep(TaskStep):
         context.deployed_agents.append(
             DeployedAgent(agent_name=self.agent_name, api_url=url, a2a_url=url, a2a_card=card)
         )
+        await context.checkpoint_resources()
         context.metadata.setdefault("human_agents", []).append(
             {"step_id": self.id, "agent_name": self.agent_name, "a2a_url": url}
         )

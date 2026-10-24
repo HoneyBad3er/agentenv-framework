@@ -9,6 +9,7 @@ import logging
 import secrets
 import string
 import time
+from functools import partial
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Self
 
 from agent_env.store.base import ConcurrentModificationError, NotFoundError
 from agent_env.config import get_config
-from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Lte, Ne, Sort, SortKey, UnknownDocumentTypeError, UpdateSpec, VersionedEntityStore, VersionedEntityStoreCache, compare_and_swap
+from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Lte, LteOrAbsent, Ne, Sort, SortKey, UnknownDocumentTypeError, UpdateSpec, VersionedEntityStore, VersionedEntityStoreCache, compare_and_swap, rev_precondition
 from agent_env.store.query import QueryBuilder, to_document_query
 from agent_env.task.step_journal import (
     _RESERVED_STEP_IDS,
@@ -29,6 +30,8 @@ from agent_env.task.step_journal import (
     replay_context,
 )
 from agent_env.task_step.context import TaskStepContext
+from agent_env.task.execution import TaskLifecycleError
+from agent_env.task.persistence import StoreDeadlineExceeded, call_store, check_store_call, current_store_deadline
 
 if TYPE_CHECKING:
     from agent_env.task.task import Task
@@ -318,9 +321,11 @@ class TaskInstanceStore:
             instance_id, task_id, task_version, total_steps, created_at_utc,
             _fresh_run_state(start_step, completed_step_docs),
         )
+        check_store_call()
         store = self._doc_store
+        check_store_call()
         store.insert(TASK_INSTANCES_COLLECTION, doc)
-        self._journal_seeded_completions(store, instance_id, completed_step_docs)
+        self._journal_seeded_completions(store, instance_id, completed_step_docs, attempt_epoch=0)
         return TaskInstance.from_dict(doc)
 
     def upsert_instance(
@@ -332,7 +337,7 @@ class TaskInstanceStore:
         start_step: int = 0,
         completed_steps: list[TaskStepResult] | None = None,
     ) -> TaskInstance | None:
-        """Idempotent register on a caller-supplied ``instance_id``."""
+        """Claim a caller-supplied id once, fencing a delayed registrar from a later claim."""
         current_time_str = datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
@@ -343,29 +348,29 @@ class TaskInstanceStore:
         fresh_doc = _new_instance_doc(
             instance_id, task_id, task_version, total_steps, current_time_str, run_state,
         )
+        check_store_call()
         store = self._doc_store
-        try:
-            store.insert(TASK_INSTANCES_COLLECTION, fresh_doc)
-            self._journal_seeded_completions(store, instance_id, completed_step_docs)
-            return TaskInstance.from_dict(fresh_doc)
-        except DuplicateKeyError:
-            # atomic inc (not read-then-set rev): stays monotonic under concurrent re-registers + racing step CAS.
-            # The same write bumps the generation, retiring the old journal without a delete that
-            # could race a completion still landing.
+        key = Filter.of(instance_id=instance_id)
+        previous = store.find_one(TASK_INSTANCES_COLLECTION, key)
+        check_store_call()
+        if previous is None:
+            try:
+                store.insert(TASK_INSTANCES_COLLECTION, fresh_doc)
+            except DuplicateKeyError as error:
+                raise SupersededAttemptError(instance_id, _SEED_STEP_ID, "another registrar claimed the instance") from error
+            updated = fresh_doc
+        else:
+            claim = key.where("attempt_epoch", rev_precondition(previous, "attempt_epoch"))
             updated = store.update_one_and_get(
-                TASK_INSTANCES_COLLECTION,
-                Filter.of(instance_id=instance_id),
+                TASK_INSTANCES_COLLECTION, claim,
                 UpdateSpec(set={k: v for k, v in run_state.items() if k != "attempt_epoch"},
-                           inc={_REV: 1, _GENERATION: 1, "attempt_epoch": 1}),
-                return_after=True,
+                           inc={_REV: 1, _GENERATION: 1, "attempt_epoch": 1}), return_after=True,
             )
             if updated is None:
-                raise RuntimeError(
-                    f"register_task_instance: instance {instance_id!r} "
-                    "disappeared during re-register"
-                )
-            self._journal_seeded_completions(store, instance_id, completed_step_docs)
-            return TaskInstance.from_dict(updated)
+                raise SupersededAttemptError(instance_id, _SEED_STEP_ID, "another registrar advanced the instance epoch")
+        check_store_call()
+        self._journal_seeded_completions(store, instance_id, completed_step_docs, attempt_epoch=updated.get("attempt_epoch", 0))
+        return TaskInstance.from_dict(updated)
 
     def file_artifact_universe_ids_for_batch(self, batch_id: str) -> list[str]:
         """Return FileArtifactUniverse ids produced by task instances in a batch.
@@ -410,25 +415,46 @@ class TaskInstanceStore:
     def count(self, task_id: str, *, task_version: int | None = None) -> int:
         return self._doc_store.count(TASK_INSTANCES_COLLECTION, _task_filter(task_id, task_version))
 
-    def seed_context(self, instance_id: str, ops: "ContextUpdateOps") -> None:
-        """Apply the run's initial context, then journal it as the replay base (even when empty)."""
+    def seed_context(
+        self, instance_id: str, ops: "ContextUpdateOps", *, attempt_epoch: int | None = None,
+    ) -> None:
+        """Seed only the registered attempt: a late write must not replace a resumed run's context or journal."""
         store = self._doc_store
-        # One entry per deployment, as completions and the replay of this seed write them.
         ops = dataclasses.replace(ops, add_to_sets={p: _union([], items, path=p) for p, items in ops.add_to_sets.items()})
-        if not ops.is_empty():
-            store.update(
-                TASK_INSTANCES_COLLECTION, Filter.of(instance_id=instance_id), ops.to_update_spec()
-            )
-        # Doc first: a failed journal write (logged by the caller) must not cost the run its seed.
-        self._journal_step(store, instance_id, _SEED_STEP_ID, ops, "seed")
+        key = Filter.of(instance_id=instance_id)
+        if attempt_epoch is None:
+            current = store.find_one(TASK_INSTANCES_COLLECTION, key)
+            if current is None:
+                raise NotFoundError(f"TaskInstance {instance_id!r} not found")
+            attempt_epoch = current.get("attempt_epoch", 0)
 
-    def _bump_journal_seq(self, store: DocumentStore, instance_id: str) -> dict | None:
+        def seed(document: dict) -> UpdateSpec:
+            if document.get("attempt_epoch", 0) != attempt_epoch:
+                raise SupersededAttemptError(instance_id, _SEED_STEP_ID, "another attempt owns the initial context")
+            check_store_call()
+            return ops.to_update_spec()
+
+        seeded = compare_and_swap(store, TASK_INSTANCES_COLLECTION, key, seed, counter_field=_REV)
+        if seeded is None:
+            raise NotFoundError(f"TaskInstance {instance_id!r} disappeared before its initial context was recorded")
+        journaled = self._journal_step(store, instance_id, _SEED_STEP_ID, ops, "seed", attempt_epoch=attempt_epoch)
+        current = store.find_one(TASK_INSTANCES_COLLECTION, key)
+        if (journaled is None or current is None or current.get("attempt_epoch", 0) != attempt_epoch
+                or current.get(_GENERATION, 0) != seeded.get(_GENERATION, 0)):
+            raise SupersededAttemptError(instance_id, _SEED_STEP_ID, "another attempt owns the initial context journal")
+
+    def _bump_journal_seq(
+        self, store: DocumentStore, instance_id: str, *, attempt_epoch: int | None = None,
+    ) -> dict | None:
         """Atomically bump the instance's journal sequence; the post-update doc, or None if the
         instance is missing."""
-        return store.update_one_and_get(
-            TASK_INSTANCES_COLLECTION, Filter.of(instance_id=instance_id),
-            UpdateSpec(inc={_JOURNAL_SEQ: 1}),
-        )
+        match = Filter.of(instance_id=instance_id)
+        if attempt_epoch == 0:
+            match = match.where("attempt_epoch", LteOrAbsent(0))
+        elif attempt_epoch is not None:
+            match = Filter.of(instance_id=instance_id, attempt_epoch=attempt_epoch)
+        check_store_call()
+        return store.update_one_and_get(TASK_INSTANCES_COLLECTION, match, UpdateSpec(inc={_JOURNAL_SEQ: 1}))
 
     def _journal_step(
         self, store: DocumentStore, instance_id: str, step_id: str, ops: "ContextUpdateOps", status: str,
@@ -438,7 +464,10 @@ class TaskInstanceStore:
         Returns ``(seq, generation)``, or None if the instance is missing, the write is
         already fenced by ``attempt_epoch``, or a later attempt already owns the row: a
         completion that will not land must not displace the entry the re-run committed."""
-        doc = self._bump_journal_seq(store, instance_id)
+        if step_id == _SEED_STEP_ID:
+            doc = self._bump_journal_seq(store, instance_id, attempt_epoch=attempt_epoch)
+        else:
+            doc = self._bump_journal_seq(store, instance_id)
         if doc is None:
             return None
         if attempt_epoch is not None and doc.get("attempt_epoch", 0) > attempt_epoch:
@@ -454,6 +483,7 @@ class TaskInstanceStore:
             "recorded_at": datetime.now(timezone.utc),  # a real datetime, so a retention index could key on it later
             "ops": ops.to_journal_dict(),
         }
+        check_store_call()
         if not self._write_journal_row(store, instance_id, step_id, row):
             return None
         return seq, generation
@@ -470,11 +500,13 @@ class TaskInstanceStore:
         key = Filter.of(instance_id=instance_id, step_id=step_id)
         older = key.where("seq", Lte(row["seq"] - 1))
         for _ in range(5):
+            check_store_call()
             if store.replace(TASK_STEP_JOURNAL_COLLECTION, older, row):
                 return True
             existing = store.find_one(TASK_STEP_JOURNAL_COLLECTION, key)
             if existing is None:
                 try:
+                    check_store_call()
                     store.insert(TASK_STEP_JOURNAL_COLLECTION, row)
                     return True
                 except DuplicateKeyError:
@@ -492,7 +524,7 @@ class TaskInstanceStore:
         return None if journaled is None else journaled[0]
 
     def _journal_seeded_completions(
-        self, store: DocumentStore, instance_id: str, completed_step_docs: list[dict],
+        self, store: DocumentStore, instance_id: str, completed_step_docs: list[dict], *, attempt_epoch: int,
     ) -> None:
         """Journal an empty entry per completion carried in from a previous attempt, so a
         completion with no entry means exactly one thing: its journal write failed. Empty is
@@ -501,7 +533,9 @@ class TaskInstanceStore:
 
         for c in completed_step_docs:
             try:
-                self._journal_step(store, instance_id, c["step_id"], ContextUpdateOps(), c["status"])
+                self._journal_step(store, instance_id, c["step_id"], ContextUpdateOps(), c["status"], attempt_epoch=attempt_epoch)
+            except TaskLifecycleError:
+                raise
             except Exception:
                 logger.warning("Failed to journal seeded step %s for instance_id=%s",
                                c["step_id"], instance_id, exc_info=True)
@@ -591,6 +625,7 @@ class TaskInstanceStore:
         store = self._doc_store
 
         def _mutate(doc: dict) -> UpdateSpec:
+            check_store_call()
             if attempt_epoch is not None and doc.get("attempt_epoch", 0) > attempt_epoch:
                 raise ValueError(f"a later attempt owns instance {instance_id!r}; refusing to undo {sorted(step_ids)}")
             entries = self._journal_entries(store, instance_id, doc.get(_GENERATION, 0))
@@ -654,6 +689,7 @@ class TaskInstanceStore:
                     fields.update(status="running", error=None, completed_at_utc=None)
                 # Otherwise the step that failed the run is still recorded — undoing a
                 # *different* step does not make the run healthy, so its error stands.
+            check_store_call()
             return UpdateSpec(set=fields)
 
         result = compare_and_swap(
@@ -663,6 +699,7 @@ class TaskInstanceStore:
         if result is None:
             return None
         for sid, seq in undone_seqs.items():
+            check_store_call()
             store.delete(
                 TASK_STEP_JOURNAL_COLLECTION,
                 Filter.of(instance_id=instance_id, step_id=sid, seq=seq),
@@ -673,6 +710,8 @@ class TaskInstanceStore:
             try:
                 self._journal_step(store, instance_id, _SCHEDULER_STEP_ID, applied_extra[0], "scheduler",
                                    attempt_epoch=result.get("attempt_epoch", 0))
+            except TaskLifecycleError:
+                raise
             except Exception:
                 logger.warning("Failed to journal the scheduler record for instance_id=%s", instance_id, exc_info=True)
         return result
@@ -714,6 +753,8 @@ class TaskInstanceStore:
             journaled = self._journal_step(
                 store, instance_id, step_id, ops, entry["status"], attempt_epoch=attempt_epoch
             )
+        except TaskLifecycleError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to journal step %s for instance_id=%s; completing without an undo record",
@@ -724,6 +765,7 @@ class TaskInstanceStore:
         declined: list[str] = []  # why the deciding _mutate refused, if it did
 
         def _mutate(doc: dict) -> UpdateSpec | None:
+            check_store_call()
             declined.clear()
             if journaled_generation is not None and doc.get(_GENERATION, 0) != journaled_generation:
                 declined.append(f"the run was re-registered (generation {journaled_generation} -> "
@@ -804,8 +846,10 @@ class TaskInstanceStore:
             spec.add_to_set = {"completed_steps": [entry]}
         match = Filter.of(instance_id=instance_id).where("status", Ne("completed"))
         if attempt_epoch is not None:
-            match = match.where("attempt_epoch", Lte(attempt_epoch))
-        self._doc_store.update(TASK_INSTANCES_COLLECTION, match, spec)
+            match = match.where("attempt_epoch", LteOrAbsent(attempt_epoch))
+        store = self._doc_store
+        check_store_call()
+        store.update(TASK_INSTANCES_COLLECTION, match, spec)
 
     def record_task_cancelled_sync(
         self, instance_id: str, reason: str, completed_at_utc: str, attempt_epoch: int | None = None,
@@ -814,8 +858,10 @@ class TaskInstanceStore:
         later attempt than ``attempt_epoch`` owns."""
         match = Filter.of(instance_id=instance_id).where("status", Ne("completed"))
         if attempt_epoch is not None:
-            match = match.where("attempt_epoch", Lte(attempt_epoch))
-        self._doc_store.update(
+            match = match.where("attempt_epoch", LteOrAbsent(attempt_epoch))
+        store = self._doc_store
+        check_store_call()
+        store.update(
             TASK_INSTANCES_COLLECTION,
             match,
             UpdateSpec(
@@ -828,7 +874,9 @@ class TaskInstanceStore:
         """Best-effort append of one attempt's failure, designed not to conflict with the
         ``record_task_failure`` write. ``add_to_set`` creates the array on the first append and
         dedupes an identical re-issued write, so it's idempotent."""
-        self._doc_store.update(
+        store = self._doc_store
+        check_store_call()
+        store.update(
             TASK_INSTANCES_COLLECTION,
             Filter.of(instance_id=instance_id).where("status", Ne("completed")),
             UpdateSpec(add_to_set={"step_attempt_failures": [failure.to_dict()]}),
@@ -910,6 +958,8 @@ def register_task_instance(
             start_step,
             completed_steps,
         )
+    except (SupersededAttemptError, TaskLifecycleError):
+        raise
     except Exception:
         if instance_id is not None:
             raise
@@ -917,7 +967,9 @@ def register_task_instance(
         return None
 
 
-def seed_task_instance_context(instance_id: str, context: "TaskStepContext") -> None:
+def seed_task_instance_context(
+    instance_id: str, context: "TaskStepContext", *, attempt_epoch: int | None = None,
+) -> None:
     """Apply the caller's initial context to an instance row created by
     ``register_task_instance``, as path-level Mongo updates.
 
@@ -928,8 +980,12 @@ def seed_task_instance_context(instance_id: str, context: "TaskStepContext") -> 
 
     ops = build_context_update_ops(None, context)
     try:
-        get_task_instance_store().seed_context(instance_id, ops)
+        get_task_instance_store().seed_context(instance_id, ops, attempt_epoch=attempt_epoch)
+    except (SupersededAttemptError, TaskLifecycleError):
+        raise
     except Exception:
+        if attempt_epoch is not None:
+            raise
         logger.warning("Failed to seed task instance context", exc_info=True)
 
 
@@ -954,11 +1010,11 @@ async def record_step_complete(
     """
     entry = dataclasses.asdict(TaskStepResult(step_id=step_id, status=status))
     try:
-        await asyncio.to_thread(
+        await call_store(partial(
             get_task_instance_store().record_step_complete_sync,
             instance_id, entry, ops, total_steps, completed_at_utc, attempt_epoch,
-        )
-    except SupersededAttemptError:
+        ), deadline=current_store_deadline())
+    except (SupersededAttemptError, TaskLifecycleError):
         raise
     except Exception:
         logger.error(
@@ -979,11 +1035,11 @@ async def undo_steps(
     write failed (logged). A refusal propagates: the store is saying it cannot rebuild that
     context, and a caller that re-dispatched anyway would run the span on a dirty one."""
     try:
-        return await asyncio.to_thread(
+        return await call_store(partial(
             get_task_instance_store().undo_steps_sync, instance_id, set(step_ids),
             extra_ops=extra_ops, bump_epoch=bump_epoch, attempt_epoch=attempt_epoch,
-        )
-    except ValueError:
+        ), deadline=current_store_deadline())
+    except (ValueError, SupersededAttemptError, TaskLifecycleError):
         raise
     except Exception:
         logger.error("Failed to undo steps %s for instance_id=%s", sorted(step_ids), instance_id, exc_info=True)
@@ -992,6 +1048,29 @@ async def undo_steps(
 
 _FAILURE_WRITE_MAX_ATTEMPTS = 3
 _FAILURE_WRITE_BACKOFF_SECONDS = 0.5
+
+
+async def _retry_store_write(operation: Callable[[], None]) -> BaseException | None:
+    deadline = current_store_deadline()
+    budget = asyncio.timeout_at(deadline)
+    last_error: BaseException | None = None
+    try:
+        async with budget:
+            for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
+                try:
+                    await call_store(operation, deadline=deadline)
+                    return None
+                except (SupersededAttemptError, TaskLifecycleError):
+                    raise
+                except Exception as error:
+                    last_error = error
+                    if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
+                        await asyncio.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
+    except TimeoutError as error:
+        if budget.expired():
+            raise StoreDeadlineExceeded("persistence retries exceeded their deadline") from error
+        raise
+    return last_error
 
 
 async def record_task_failure(
@@ -1012,18 +1091,12 @@ async def record_task_failure(
     to "failed".
     """
     store = get_task_instance_store()
-    last_exc: BaseException | None = None
-    for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
-        try:
-            await asyncio.to_thread(
-                store.record_task_failure_sync,
-                instance_id, failing_step_id, context, error, completed_at_utc, attempt_epoch,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
-                await asyncio.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
+    last_exc = await _retry_store_write(partial(
+        store.record_task_failure_sync,
+        instance_id, failing_step_id, context, error, completed_at_utc, attempt_epoch,
+    ))
+    if last_exc is None:
+        return
     logger.warning(
         "Failed to record task failure after %d attempts; the task instance record "
         "will not show it",
@@ -1042,6 +1115,8 @@ def record_task_cancelled(instance_id: str, reason: str, completed_at_utc: str, 
         try:
             store.record_task_cancelled_sync(instance_id, reason, completed_at_utc, attempt_epoch)
             return
+        except (SupersededAttemptError, TaskLifecycleError):
+            raise
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
@@ -1055,15 +1130,9 @@ def record_task_cancelled(instance_id: str, reason: str, completed_at_utc: str, 
 # transient write (like ``record_task_failure``), then logs and swallows — never raises.
 async def append_step_attempt_failure(instance_id: str, failure: "StepAttemptFailure") -> None:
     store = get_task_instance_store()
-    last_exc: BaseException | None = None
-    for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
-        try:
-            await asyncio.to_thread(store.append_step_attempt_failure_sync, instance_id, failure)
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
-                await asyncio.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
+    last_exc = await _retry_store_write(partial(store.append_step_attempt_failure_sync, instance_id, failure))
+    if last_exc is None:
+        return
     logger.warning(
         "Failed to append attempt-failure ledger entry for instance_id=%s after %d attempts",
         instance_id, _FAILURE_WRITE_MAX_ATTEMPTS, exc_info=last_exc,

@@ -9,10 +9,12 @@ import inspect
 import itertools
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
 from agent_env.config import run_env_ids
@@ -20,8 +22,12 @@ from agent_env.plugins import _registration
 from agent_env.store.document_store import UnknownDocumentTypeError
 from agent_env.store.routing import run_scope
 from agent_env.task.execution import StepExecution, TaskLifecycleError, executing_step
+from agent_env.task.merge import merge_step_context, retain_step_resources
+from agent_env.task.persistence import DEFAULT_STORE_TIMEOUT_SECONDS, call_store, current_store_deadline, store_deadline
+from agent_env.task.resources import record_resource_context
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
+from agent_env.task_step.resource_tracking import TORN_DOWN_RESOURCE_KEY, ResourceCheckpoint, tracking_resources
 from agent_env.task_step.task_step import RetryConfig, TaskStep
 
 if TYPE_CHECKING:
@@ -79,10 +85,10 @@ def _overlapping_survivors(
 ) -> list[str]:
     """Completed steps outside the span whose execution window overlapped a span member's.
 
-    Until per-step isolation lands, a step's journaled diff is taken against the
-    shared in-memory context, so a step that ran while a span member ran may have journaled
-    the member's writes; replaying it would rebuild the span's world dirty. Windows are
-    (dispatch tick, end tick); a step never dispatched has none and cannot overlap.
+    Concurrent rollback alongside surviving work is not supported by the retry scheduler.
+    Keep this conservative execution-window gate even though isolated step journals no
+    longer contain sibling writes. Windows are (dispatch tick, end tick); a step never
+    dispatched has none and cannot overlap.
     """
     members = [windows[x] for x in rollback_ids if x in windows]
     return sorted(
@@ -210,8 +216,8 @@ async def _roll_back_span(
 
     Abort cases: no task-instance record (nothing to undo through); the store refuses (a run
     that predates the journal, or a surviving step with no entry); the write fails; or a
-    surviving step ran concurrently with a span member, whose diff may carry the span's writes
-    (``_overlapping_survivors``). The write is shielded from cancellation and, once landed,
+    surviving step ran concurrently with a span member, which the retry scheduler does not
+    yet support (``_overlapping_survivors``). The write is shielded from cancellation and, once landed,
     the live context is always brought in line with it.
     """
     from agent_env.task import store as _store
@@ -233,8 +239,7 @@ async def _roll_back_span(
     if overlapping:
         logger.error(
             "%sCannot retry step %s: steps %s completed while the span was executing, so "
-            "their journaled diffs may include the span's writes (exact per-step diffs need "
-            "per-step isolation, which is not yet implemented); failing with the original error.",
+            "concurrent rollback with surviving steps is unsupported; failing with the original error.",
             log_prefix, failed_id, overlapping,
         )
         return None
@@ -419,16 +424,21 @@ class Task:
         instance_id: str | None = None,
         *,
         completed_step_ids: set[str] | None = None,
+        resource_checkpoint: ResourceCheckpoint | None = None,
+        resource_checkpoint_timeout_seconds: float = DEFAULT_STORE_TIMEOUT_SECONDS,
     ) -> TaskStepContext:
         """Run steps per their depends_on DAG. Per-step `fail_task_on_error`
         (default True) controls halt-on-failure; failures land in
         context.metadata['failed_steps']. The run is scoped to this task's id, so under namespace
         routing an ``@local`` task's records stay in the local stores.
         """
+        if not math.isfinite(resource_checkpoint_timeout_seconds) or resource_checkpoint_timeout_seconds <= 0:
+            raise ValueError("resource_checkpoint_timeout_seconds must be finite and positive")
         with run_scope(self.id), run_env_ids((context.metadata.get("user_overrides") or {}) if context else {}):
             return await self._run(
                 on_step_start, on_step_complete, agent_model, agent_artifact_id,
-                start_step, end_step, context, instance_id, completed_step_ids,
+                start_step, end_step, context, instance_id, completed_step_ids, resource_checkpoint,
+                resource_checkpoint_timeout_seconds,
             )
 
     async def _run(
@@ -442,6 +452,8 @@ class Task:
         context: TaskStepContext | None,
         instance_id: str | None,
         completed_step_ids: set[str] | None,
+        resource_checkpoint: ResourceCheckpoint | None,
+        resource_checkpoint_timeout_seconds: float,
     ) -> TaskStepContext:
         from .store import (
             TaskStepResult,
@@ -503,21 +515,36 @@ class Task:
             TaskStepResult(step_id=step.id, status=TaskStepStatus.SUCCESS)
             for step in steps if step.id in state.completed
         ]
-        instance = register_task_instance(
-            self.id,
-            self.version,
-            total,
-            start_step,
-            instance_id=instance_id,
-            completed_steps=completed_steps,
-        )
+        async def initialize_instance():
+            instance = await call_store(partial(register_task_instance,
+                self.id, self.version, total, start_step,
+                instance_id=instance_id, completed_steps=completed_steps,
+            ), deadline=current_store_deadline())
+            if instance:
+                context.instance_id = instance.instance_id
+                state.epoch = instance.attempt_epoch
+                await call_store(partial(seed_task_instance_context, instance.instance_id, copy.deepcopy(context),
+                                         attempt_epoch=instance.attempt_epoch), deadline=current_store_deadline())
+            return instance
+
+        initializing = asyncio.create_task(initialize_instance())
+        interrupted = False
+        while not initializing.done():
+            try:
+                await asyncio.shield(initializing)
+            except asyncio.CancelledError:
+                interrupted = True
+        instance = initializing.result()
         instance_id = instance.instance_id if instance else None
         context.instance_id = instance_id
-        if instance_id:
-            seed_task_instance_context(instance_id, context)
+        if interrupted:
+            if instance_id:
+                from .store import record_task_cancelled
 
-        if instance:
-            state.epoch = instance.attempt_epoch
+                await call_store(partial(record_task_cancelled, instance_id, "cancelled", self._utc_now_str(), state.epoch),
+                                 deadline=asyncio.get_running_loop().time() + DEFAULT_STORE_TIMEOUT_SECONDS)
+            raise asyncio.CancelledError
+
         if instance_id and len(state.completed) == len(steps):
             await record_step_complete(
                 instance_id, steps[-1].id, ContextUpdateOps(), total, self._utc_now_str(),
@@ -526,7 +553,7 @@ class Task:
         # _drive_dag drains in-flight steps and records the failure itself if it raises.
         first_error, first_error_step_id = await self._drive_dag(
             steps, state, total, context, instance_id,
-            on_step_start, on_step_complete, log_prefix,
+            on_step_start, on_step_complete, log_prefix, resource_checkpoint, resource_checkpoint_timeout_seconds,
         )
         if first_error is not None:
             await self._handle_failure(first_error_step_id, first_error, context, instance_id, state.epoch)
@@ -542,6 +569,8 @@ class Task:
         on_step_start,
         on_step_complete,
         log_prefix: str,
+        resource_checkpoint: ResourceCheckpoint | None,
+        resource_checkpoint_timeout_seconds: float,
     ) -> tuple[BaseException | None, str | None]:
         """The DAG scheduler, with in-loop rollback-and-re-dispatch retry.
 
@@ -568,18 +597,17 @@ class Task:
         first_error: BaseException | None = None
         first_error_step_id: str | None = None
         retry_counts: dict[str, int] = {}
-        # Execution windows (dispatch tick, end tick) per step, for the retry's concurrency
-        # gate: a step that ran while a span member ran may have journaled its writes.
+        pending_commits: dict[str, tuple[TaskStepContext, TaskStepContext]] = {}
+        # Execution windows retain the retry scheduler's conservative concurrency gate.
         clock = itertools.count()
         started: dict[str, int] = {}
         ended: dict[str, int] = {}
 
         async def _heartbeat_step(
-            step: TaskStep, pre_context: TaskStepContext, status, dispatch_epoch: int,
+            step: TaskStep, ops: ContextUpdateOps, status, dispatch_epoch: int,
         ) -> None:
             if not instance_id:
                 return
-            ops = build_context_update_ops(pre_context, context)
             # Module attribute (not a bound import) so record_step_complete stays
             # patchable; the upsert-by-step_id keeps a re-dispatched step
             # idempotent, and dispatch_epoch fences a rolled-back straggler.
@@ -611,31 +639,87 @@ class Task:
                 result = on_step_start(idx, total, step, context)
                 if inspect.isawaitable(result):
                     await result
-            # Snapshot context before dispatch so we can emit only the fields
-            # this step actually changed — concurrent sibling writes to other
-            # fields are preserved by Mongo's single-document atomicity.
             pre_context = copy.deepcopy(context)
+            step_context = copy.deepcopy(pre_context)
+            owned_resources = TaskStepContext(instance_id=instance_id)
             started_mono = time.monotonic()
             started_utc = datetime.now(timezone.utc).isoformat()
+
+            async def checkpoint(snapshot: TaskStepContext, *, final: bool = False) -> None:
+                retain_step_resources(source=snapshot, target=owned_resources)
+                deadline = (asyncio.get_running_loop().time() + resource_checkpoint_timeout_seconds
+                            if final else current_store_deadline())
+                persistence_error = None
+                if instance_id:
+                    try:
+                        await record_resource_context(snapshot, attempt_epoch=dispatch_epoch, deadline=deadline)
+                    except Exception as error:
+                        persistence_error = error
+                if resource_checkpoint is not None:
+                    with store_deadline(deadline):
+                        async with asyncio.timeout_at(deadline):
+                            await resource_checkpoint(snapshot)
+                if persistence_error is not None:
+                    raise persistence_error
+
+            async def checkpoint_final_resources() -> None:
+                if (all(getattr(pre_context, name) == getattr(step_context, name)
+                        for name in ("deployed_envs", "deployed_agents", "deployed_sandboxes"))
+                        and all(pre_context.metadata.get(name) == step_context.metadata.get(name)
+                                for name in (TORN_DOWN_RESOURCE_KEY, "agent_changelog"))):
+                    return
+                pending = asyncio.create_task(checkpoint(step_context, final=True))
+                interrupted = False
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                pending.result()
+                if interrupted:
+                    raise asyncio.CancelledError
+
             try:
                 with executing_step(StepExecution(instance_id=instance_id, step_id=step.id, attempt_epoch=dispatch_epoch)):
-                    await step.execute(context)
+                    with tracking_resources(checkpoint):
+                        try:
+                            await step.execute(step_context)
+                        finally:
+                            await checkpoint_final_resources()
+                ops = build_context_update_ops(pre_context, step_context)
+                proposed = copy.deepcopy(context)
+                for reserved_before, reserved_after in pending_commits.values():
+                    merge_step_context(before=reserved_before, after=reserved_after, target=proposed)
+                merge_step_context(before=pre_context, after=step_context, target=proposed)
+                pending_commits[step.id] = (pre_context, step_context)
+                try:
+                    await _heartbeat_step(step, ops, _store.TaskStepStatus.SUCCESS, dispatch_epoch)
+                    merge_step_context(before=pre_context, after=step_context, target=context)
+                finally:
+                    pending_commits.pop(step.id, None)
+                retain_step_resources(source=owned_resources, target=context)
             except asyncio.CancelledError:
+                retain_step_resources(source=owned_resources, target=context)
                 raise
             except BaseException as exc:
+                retain_step_resources(source=owned_resources, target=context)
                 duration = time.monotonic() - started_mono
                 fatal = isinstance(exc, TaskLifecycleError) or getattr(step, "fail_task_on_error", True)
-                context.metadata.setdefault("failed_steps", []).append({
+                failure = {
                     "step_id": step.id, "step_type": step.type,
                     "error": str(exc), "error_type": type(exc).__name__,
                     "started_at_utc": started_utc, "duration_seconds": duration,
                     "is_fatal": fatal,
-                })
+                }
+                context.metadata.setdefault("failed_steps", []).append(failure)
                 if not fatal:
-                    await _heartbeat_step(step, pre_context, _store.TaskStepStatus.FAILURE, dispatch_epoch)
+                    failure_context = copy.deepcopy(pre_context)
+                    retain_step_resources(source=owned_resources, target=failure_context)
+                    failure_context.metadata.setdefault("failed_steps", []).append(failure)
+                    await _heartbeat_step(step, build_context_update_ops(pre_context, failure_context),
+                                          _store.TaskStepStatus.FAILURE, dispatch_epoch)
                 raise
             duration = time.monotonic() - started_mono
-            await _heartbeat_step(step, pre_context, _store.TaskStepStatus.SUCCESS, dispatch_epoch)
             logger.info(
                 "%sStep %s (%s) completed in %.1fs",
                 log_prefix, step.id, step.type, duration,
@@ -648,7 +732,7 @@ class Task:
         async def _drain_in_flight(*, propagate_cancellation: bool = True) -> set[str]:
             """Cancel and await every in-flight step; return the ids cancelled.
 
-            A sibling cancelled mid-execute may hold partial context writes, so the
+            A sibling cancelled mid-execute may own resources or external effects, so the
             caller rolls those ids back too. Cancellation cannot interrupt an
             in-flight persist; the epoch fence, not the cancel, stops a drained
             step's late write."""
@@ -766,9 +850,9 @@ class Task:
             except TaskLifecycleError as cleanup_error:
                 failure = cleanup_error
             if instance_id and first_error is None and isinstance(failure, asyncio.CancelledError):
-                await asyncio.to_thread(
+                await call_store(partial(
                     _store.record_task_cancelled, instance_id, str(failure) or "cancelled", Task._utc_now_str(), state.epoch,
-                )
+                ), deadline=asyncio.get_running_loop().time() + DEFAULT_STORE_TIMEOUT_SECONDS)
             elif instance_id:
                 # Record with the fatal step's attribution: a cancellation landing
                 # during the drain would otherwise overwrite the instance record

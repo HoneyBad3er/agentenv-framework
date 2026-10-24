@@ -43,8 +43,8 @@ class EpisodeSpec:
         return cls(copy=Task(id=task.id, version=task.version, steps=steps), trainer_agents=tuple(outside), seed=seed)
 
     async def start(self) -> Episode:
-        """Start one run of the task, a new episode each call. It returns once the run's record exists, before
-        anything is deployed; ``next_turn()`` is where the deploys and setup are waited for."""
+        """Start one run of the task, a new episode each call. It returns once the run's record exists or the run
+        has ended. Deploys and setup may be in flight; ``next_turn()`` waits for the next outside turn."""
         episode_id = uuid.uuid4().hex
         metadata: dict[str, Any] = {"episode": {"id": episode_id, "trainer_agents": list(self.trainer_agents)}}
         if self._seed:

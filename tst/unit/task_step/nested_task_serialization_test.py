@@ -143,3 +143,21 @@ def test_repeat_until_rejects_unsafe_predicate_or_feedback(field, value):
 ])
 def test_repeat_condition_compares_json_types_recursively(left, right, expected):
     assert json_values_equal(left, right) is expected
+
+
+@pytest.mark.parametrize("reserved", (
+    "keep", "torn_down_sandbox_ids", "runner", "episode", "agent_changelog", "agent_changelog_rewinds",
+    "agent_loaded_snapshots",
+))
+@pytest.mark.parametrize("field", ("input_bindings", "output_bindings", "feedback_bindings"))
+@pytest.mark.parametrize("position", ("source", "target"))
+def test_bindings_reject_lifecycle_and_runner_metadata_as_either_source_or_target(reserved, field, position):
+    bindings = {"candidate": reserved} if position == "source" else {reserved: "candidate"}
+    kwargs = {**step_kwargs(), field: bindings}
+    step_class = SubDAGTaskStep
+    if field == "feedback_bindings":
+        step_class = RepeatUntilTaskStep
+        kwargs.update(max_iterations=2, until_key="done", until_value=True)
+
+    with pytest.raises(ValueError, match=field):
+        step_class(**kwargs)

@@ -12,6 +12,10 @@ class TaskLifecycleError(RuntimeError):
     """A task cannot safely retry or tolerate an incomplete resource lifecycle."""
 
 
+class ContextWriteConflict(TaskLifecycleError):
+    """Concurrent steps proposed incompatible writes to the same context path."""
+
+
 @dataclass(frozen=True)
 class StepExecution:
     instance_id: str | None

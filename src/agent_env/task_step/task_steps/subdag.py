@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 from agent_env.task.nested import run_child
 from agent_env.task.task import Task
 from agent_env.task_step.context import TaskStepContext, _REDACTED_KEYS, _strip_redacted_keys
+from agent_env.task_step.resource_tracking import TORN_DOWN_RESOURCE_KEY
 from agent_env.task_step.task_step import RetryConfig, TaskStep, TaskStepDependency
 
 
@@ -17,6 +18,8 @@ _FRAMEWORK_METADATA_KEYS = frozenset({
     "user_overrides", "failed_steps", "child_runs", "runtime", "seed", "workflow_id",
     "run_group_id", "pass_at_k_execution_id", "instance_id", "start_step", "retry_resets",
     "models", "step_overrides", "step_params", "parent_task", *_REDACTED_KEYS,
+    "keep", "runner", "episode", "agent_changelog", "agent_changelog_rewinds", "agent_loaded_snapshots",
+    TORN_DOWN_RESOURCE_KEY,
 })
 
 

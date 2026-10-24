@@ -175,4 +175,5 @@ class DeploySandboxTaskStep(TaskStep):
             vnc_url=sandbox.vnc_url,
             network_policy=sandbox.network_policy.to_dict() if sandbox.network_policy else None,
         ))
+        await context.checkpoint_resources()
         return context

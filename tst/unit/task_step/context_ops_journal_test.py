@@ -4,6 +4,9 @@ context rebuilt from the store gets its secrets regrafted."""
 
 from __future__ import annotations
 
+import pytest
+
+from agent_env.task.step_journal import replay_context
 from agent_env.task.task import _rebuild_context
 from agent_env.task_step.context import HEARTBEAT_KEY, TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
@@ -104,3 +107,15 @@ def test_the_runner_heartbeat_is_never_persisted_but_survives_a_rebuild():
     assert HEARTBEAT_KEY not in repr(build_context_update_ops(None, live).to_journal_dict())
     _rebuild_context(live, stored)
     assert live.metadata[HEARTBEAT_KEY] is beat
+
+
+@pytest.mark.parametrize("value", [{}, [], {"nested": {}}, {"nested": []}])
+def test_new_empty_containers_are_recorded_in_seed_and_step_journals(value):
+    ops = build_context_update_ops(None, TaskStepContext(metadata={"payload": value}))
+    restored = replay_context([{"step_id": "__seed__", "ops": ops.to_journal_dict()}], ())
+    assert restored["metadata"]["payload"] == value
+
+
+def test_unchanged_mapping_with_dotted_keys_emits_no_wholesale_stale_write():
+    context = TaskStepContext(metadata={"payload": {"literal.key": "kept"}})
+    assert build_context_update_ops(context, context).is_empty()

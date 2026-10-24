@@ -1040,7 +1040,7 @@ async def test_failed_child_mutations_are_not_replayed_as_completed_work_on_resu
 
     original = get_child_invocation_store().list_for_parent(context.instance_id)[0]
     failed_child = get_task_instance_store().get(original.child_instance_id)
-    assert failed_child.context["metadata"]["count"] == 1
+    assert failed_child.context["metadata"]["count"] == 0
     assert original.outcome is None
     assert "result" not in context.metadata
 
@@ -1072,3 +1072,22 @@ async def test_all_completed_step_ids_skip_dispatch_and_persist_a_terminal_compl
     assert {step.step_id for step in instance.completed_steps} == {"first", "last"}
     assert all(step.status is TaskStepStatus.SUCCESS for step in instance.completed_steps)
     assert instance.context["metadata"]["first_effect"] == instance.context["metadata"]["last_effect"] == "retained"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, [], {"nested": {}}, {"nested": []}])
+async def test_empty_json_inputs_survive_child_journal_resume(nested_state: ProbeState, payload) -> None:
+    task = Task(id="empty-input-resume-parent", version=1, steps=[subdag_step(
+        child_task(ProbeStep(id="completed"), ProbeStep(id="fail-once", action="fail_once")),
+        input_bindings={"payload": "source"}, output_bindings={"result": "payload"},
+    )])
+    context = TaskStepContext(metadata={"source": copy.deepcopy(payload)})
+    with pytest.raises(ChildTaskFailed):
+        await task.run(context=context)
+
+    resumed = await resume_parent(task, context.instance_id)
+
+    assert resumed.metadata["result"] == payload
+    assert nested_state.calls["completed"] == 1
+    assert nested_state.calls["fail-once"] == 2
+    assert all(metadata["payload"] == payload for _, _, metadata in nested_state.observed)

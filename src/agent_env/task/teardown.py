@@ -12,13 +12,20 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import NamedTuple, Optional
 
 from agent_env.a2a_agent.staging import drain_all, staged_changelogs
 from agent_env.env.env import DeployedEnv
 from agent_env.providers.sandbox_providers.local_sandbox import remove_local_work_dir
 from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider
+from agent_env.store.base import NotFoundError
+from agent_env.store.routing import run_scope
 from agent_env.task.interrupts import tearing_down
+from agent_env.task.persistence import call_store
+from agent_env.task.recovery import merge_resource_contexts, recover_child_tree
+from agent_env.task.resources import load_resource_context, record_resource_context
+from agent_env.task.store import get_task_instance_store
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.teardown_sandboxes import (
     _DEFAULT_PROVIDERS, TORN_DOWN_KEY, _env_sandbox_ids, _sandbox_ids_of,
@@ -87,6 +94,40 @@ def sandbox_ids(record) -> list[str]:
 
 
 async def teardown_run(context: TaskStepContext, *, timeout: float = TERMINATE_TIMEOUT_SECONDS) -> TeardownReport:
+    original_context = context
+    deadline = asyncio.get_running_loop().time() + timeout
+    reports = []
+    if context.instance_id:
+        reports.extend(await recover_child_tree(
+            parent_instance_id=context.instance_id, timeout_seconds=timeout,
+            cleanup=_cleanup_context, deadline=deadline,
+        ))
+        inventory = await load_resource_context(context.instance_id, deadline=deadline)
+        context = merge_resource_contexts(context, inventory)
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        reports.append(TeardownReport.skipped(context))
+    else:
+        reports.append(await _cleanup_context(context, timeout if context.instance_id is None else remaining))
+    if TORN_DOWN_KEY in context.metadata:
+        original_context.metadata[TORN_DOWN_KEY] = list(context.metadata[TORN_DOWN_KEY])
+        if context.instance_id:
+            report_deadline = asyncio.get_running_loop().time() + timeout
+            with run_scope(context.instance_id):
+                try:
+                    instance = await call_store(partial(get_task_instance_store().get, context.instance_id), deadline=report_deadline)
+                except NotFoundError:
+                    pass
+                else:
+                    await record_resource_context(context, attempt_epoch=instance.attempt_epoch, deadline=report_deadline)
+    return TeardownReport(
+        terminated=tuple(resource for report in reports for resource in report.terminated),
+        failed=tuple(failure for report in reports for failure in report.failed),
+        left=tuple(resource for report in reports for resource in report.left),
+    )
+
+
+async def _cleanup_context(context: TaskStepContext, timeout: float) -> TeardownReport:
     """Terminate every sandbox ``context`` records, all at once, each within ``timeout`` seconds, and remove a
     local one's work folder once it's down.
 

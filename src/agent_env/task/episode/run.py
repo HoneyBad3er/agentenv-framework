@@ -172,6 +172,7 @@ class Episode:
         _live[self.id] = self
         running = asyncio.Event()
         self._run = asyncio.create_task(self._drive(running))
+        self._run.add_done_callback(lambda completed: running.set())
         try:
             await running.wait()
         except asyncio.CancelledError:
@@ -181,9 +182,11 @@ class Episode:
             raise
 
     async def _drive(self, running: asyncio.Event) -> None:
-        running.set()
+        def acknowledge_registration(index, total, step, context) -> None:
+            running.set()
+
         try:
-            await self._task.run(context=self._context, instance_id=self.id)
+            await self._task.run(context=self._context, instance_id=self.id, on_step_start=acknowledge_registration)
         finally:
             self._tearing_down = True
             try:

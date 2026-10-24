@@ -213,6 +213,15 @@ orchestrators call it the same way. What callers rely on:
 - `completed_step_ids` resumes a DAG with completed independent branches: the named steps must
   belong to the active graph and include their dependencies. Their effects must already be in
   the supplied context.
+- Every step executes against an isolated context snapshot. Successful steps publish their own
+  changes; failed and cancelled steps retain resource ownership without publishing partial domain
+  outputs. Disjoint dictionary writes merge, identical writes agree, append-only lists use set
+  semantics, and incompatible concurrent writes raise fatal `ContextWriteConflict`. Mappings whose
+  keys cannot be stored as update paths and newly created empty containers are indivisible writes.
+- A step that provisions a resource calls `await context.checkpoint_resources()` as soon as its
+  provider identity is known, before another await. Resource inventories persist independently of
+  committed outputs. The scheduler also checkpoints changed resource lists on step exit, but an
+  unmodified plugin that registers resources late cannot survive a hard crash in that gap.
 - `subdag` embeds a task definition with explicit metadata `input_bindings` and `output_bindings`.
   `repeat_until` adds `max_iterations`, a type-strict JSON `until_key` / `until_value` comparison
   and `feedback_bindings` between iterations. Both require positive `child_timeout_seconds` and
@@ -229,6 +238,19 @@ orchestrators call it the same way. What callers rely on:
   `TaskLifecycleError`, which remains fatal through cancellation and overrides step tolerance and
   retries. Metadata bindings cannot export live resources or framework execution settings. Child
   instances and links are recorded; the explorer does not render a nested run tree.
+- Teardown traverses durable child links across generations, including resources checkpointed by
+  incomplete steps. LocalRunner cleans an orphan's resource tree before marking its run terminal;
+  a failed cleanup remains pending for reconciliation. Confirmed termination is recorded so retries
+  skip those resources. Provider creation and ownership registration are not one transaction:
+  providers still need idempotent creation or expiration for a crash between them.
+- Task persistence runs outside the event loop with bounded deadlines and bounded physical worker
+  capacity, including operations whose callers time out. Nested execution and cleanup have separate
+  budgets; resource finalization shares the configured checkpoint budget. Attempt epochs fence
+  mutation and initial context writes. A timed-out backend RPC cannot be killed by Python and may
+  still finish; this is not a distributed lease or an exactly-once execution guarantee.
+  Ordinary backend errors from completion writes retain the existing best-effort logging policy;
+  returning from completion is not a transactional durability acknowledgement. Lifecycle and
+  ownership errors propagate instead of being treated as successful completion.
 - A runner that must hear from a long step puts a zero-argument callable at
   `context.metadata[HEARTBEAT_KEY]` (`task_step/context.py`); a step that blocks for long calls
   `context.heartbeat()`, a no-op without one. The key is in `_REDACTED_KEYS`, so it is never persisted.

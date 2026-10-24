@@ -25,9 +25,8 @@ class ContextUpdateOps:
     Dot-paths are rooted at the TaskInstance document (they include the
     ``context.`` prefix). Compile to a backend-agnostic ``UpdateSpec`` via `to_update_spec`.
 
-    Lists are set-semantic: when a step's "post" snapshot reads the shared in-memory
-    context it sees concurrent siblings' appends too, so the diff's tail may include
-    their items and the write must dedupe (``$addToSet`` via ``to_update_spec``, or
+    Lists are set-semantic: isolated steps can append identical items concurrently,
+    so completion writes dedupe (``$addToSet`` via ``to_update_spec``, or
     the Python ``_union`` the completion CAS in ``task/store.py`` applies). **Constraint:**
     items in any list must be uniquely identifiable by value, or duplicates are silently
     dropped on write; ``deployed_envs`` are told apart by ``instance_id`` (``step_journal._item_key``).
@@ -186,6 +185,8 @@ def _diff_dict(
     (contain ``.`` or start with ``$``), emit a wholesale ``$set`` of the
     whole dict at ``path`` instead of recursing.
     """
+    if pre == post:
+        return
     if _has_unmappable_keys(pre) or _has_unmappable_keys(post):
         ops.sets[path] = _strip_redacted_keys(post)
         return
@@ -200,7 +201,9 @@ def _diff_dict(
             continue
         sub_path = f"{path}.{k}"
         if k not in pre:
-            if isinstance(post_v, dict):
+            if post_v == {} or post_v == []:
+                ops.sets[sub_path] = post_v.copy()
+            elif isinstance(post_v, dict):
                 _diff_dict(sub_path, {}, post_v, ops)
             elif isinstance(post_v, list):
                 if post_v:

@@ -398,6 +398,11 @@ class DeployAgentTaskStep(TaskStep):
             deploy_kwargs["sandbox"] = linked_sandbox
         deployed = await agent.deploy(**deploy_kwargs)
         deployed_agents.append(agent)
+        resource_context = TaskStepContext(instance_id=context.instance_id, deployed_agents=[DeployedAgent(
+            agent_name=self.agent_name, api_url=deployed.a2a_url, sandbox_id=deployed.sandbox_id,
+            sandbox_type=deployed.sandbox_type, instance_id=deployed.instance_id,
+        )])
+        await resource_context.checkpoint_resources()
         a2a_url = deployed.a2a_url
         card = deployed.agent_card
         logger.info(f"A2A agent '{a2a_agent_id}' deployed at {a2a_url}")
@@ -506,6 +511,7 @@ class DeployAgentTaskStep(TaskStep):
             role=self.role,
             network_policy=deployed.network_policy,
         ))
+        await context.checkpoint_resources()
         return context
 
     def _resolved_ttl_seconds(self, context: TaskStepContext) -> int:
@@ -569,6 +575,7 @@ class DeployAgentTaskStep(TaskStep):
             entry["staging_url"] = store.namespaces[-1].staging_url
             entry["staging_max_object_bytes"] = store.namespaces[-1].max_object_bytes
         context.metadata.setdefault("agent_changelog", []).append(entry)
+        await context.checkpoint_resources()
         logger.info(f"agent-changelog capture enabled on '{self.agent_name}': {namespace_url}")
 
     async def _apply_agent_changelog(

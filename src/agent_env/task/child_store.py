@@ -14,6 +14,7 @@ from agent_env.store.base import NotFoundError
 from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Sort, SortKey, UpdateSpec, compare_and_swap
 from agent_env.task.store import TASK_INSTANCES_COLLECTION, SupersededAttemptError, TaskInstance
 from agent_env.task_step.context import TaskStepContext
+from agent_env.task_step.task_steps.teardown_sandboxes import TORN_DOWN_KEY
 
 TASK_CHILD_INVOCATIONS_COLLECTION = "task_child_invocations"
 _KEY_FIELDS = ["parent_instance_id", "parent_step_id", "parent_step_generation", "iteration"]
@@ -53,6 +54,7 @@ class ChildInvocation:
     task_definition: dict
     captured_inputs: dict
     outcome: dict | None = None
+    cleanup_context: dict | None = None
     cleanup_state: ChildCleanupState = ChildCleanupState.PENDING
     cleanup_error: str | None = None
     rev: int = 0
@@ -63,7 +65,8 @@ class ChildInvocation:
             "parent_step_generation": self.parent_step_generation, "parent_attempt_epoch": self.parent_attempt_epoch,
             "iteration": self.iteration, "child_instance_id": self.child_instance_id,
             "task_definition": self.task_definition, "captured_inputs": self.captured_inputs,
-            "outcome": self.outcome, "cleanup_state": str(self.cleanup_state), "cleanup_error": self.cleanup_error,
+            "outcome": self.outcome, "cleanup_context": self.cleanup_context,
+            "cleanup_state": str(self.cleanup_state), "cleanup_error": self.cleanup_error,
             "rev": self.rev,
         })
 
@@ -74,7 +77,8 @@ class ChildInvocation:
             parent_step_generation=document["parent_step_generation"], parent_attempt_epoch=document["parent_attempt_epoch"],
             iteration=document["iteration"], child_instance_id=document["child_instance_id"],
             task_definition=copy.deepcopy(document["task_definition"]), captured_inputs=copy.deepcopy(document["captured_inputs"]),
-            outcome=copy.deepcopy(document.get("outcome")), cleanup_state=ChildCleanupState(document["cleanup_state"]),
+            outcome=copy.deepcopy(document.get("outcome")), cleanup_context=copy.deepcopy(document.get("cleanup_context")),
+            cleanup_state=ChildCleanupState(document["cleanup_state"]),
             cleanup_error=document.get("cleanup_error"), rev=document.get("rev", 0),
         )
 
@@ -197,6 +201,62 @@ class ChildInvocationStore:
             return UpdateSpec(set={"outcome": captured})
 
         return self._update(invocation, finish)
+
+    def capture_cleanup_context(self, invocation: ChildInvocation, *, context: dict) -> ChildInvocation:
+        captured = _json_snapshot(TaskStepContext.from_dict(context).to_safe_dict())
+
+        def capture(current: ChildInvocation) -> UpdateSpec:
+            previous = current.cleanup_context or {}
+            merged = copy.deepcopy(captured)
+            for field in ("deployed_envs", "deployed_agents", "deployed_sandboxes"):
+                records = {json.dumps(value, sort_keys=True): value for value in previous.get(field) or []}
+                records.update({json.dumps(value, sort_keys=True): value for value in captured.get(field) or []})
+                merged[field] = list(records.values())
+            for field in ("retry_resets", "agent_changelog"):
+                previous_entries = (previous.get("metadata") or {}).get(field) or []
+                current_entries = (captured.get("metadata") or {}).get(field) or []
+                entries = {json.dumps(value, sort_keys=True): value for value in [*previous_entries, *current_entries]}
+                if entries:
+                    merged.setdefault("metadata", {})[field] = list(entries.values())
+            terminated = set((previous.get("metadata") or {}).get(TORN_DOWN_KEY) or ())
+            terminated.update((captured.get("metadata") or {}).get(TORN_DOWN_KEY) or ())
+            if terminated:
+                merged.setdefault("metadata", {})[TORN_DOWN_KEY] = sorted(terminated)
+            return UpdateSpec(set={"cleanup_context": merged})
+
+        return self._update(invocation, capture)
+
+    def recover_cleanup_state(
+        self, invocation: ChildInvocation, *, parent_attempt_epoch: int,
+        state: ChildCleanupState, error: str | None = None, context: dict | None = None,
+    ) -> ChildInvocation:
+        store = self._doc_store
+
+        def check_parent() -> None:
+            document = store.find_one(TASK_INSTANCES_COLLECTION, Filter.of(instance_id=invocation.parent_instance_id))
+            if document is None:
+                raise NotFoundError(f"TaskInstance {invocation.parent_instance_id!r} not found")
+            if document.get("attempt_epoch", 0) != parent_attempt_epoch:
+                raise SupersededAttemptError(invocation.parent_instance_id, invocation.parent_step_id,
+                                             "another attempt owns parent resource recovery")
+
+        def record(document: dict) -> UpdateSpec:
+            check_parent()
+            current = ChildInvocation.from_dict(document)
+            if current.rev != invocation.rev or current.child_instance_id != invocation.child_instance_id:
+                raise SupersededAttemptError(invocation.parent_instance_id, invocation.parent_step_id,
+                                             "the child invocation changed during resource recovery")
+            fields = {"cleanup_state": str(ChildCleanupState(state)), "cleanup_error": error}
+            if context is not None:
+                fields["cleanup_context"] = _json_snapshot(TaskStepContext.from_dict(context).to_safe_dict())
+            return UpdateSpec(set=fields)
+
+        check_parent()
+        document = compare_and_swap(store, TASK_CHILD_INVOCATIONS_COLLECTION, self._key(invocation), record, counter_field="rev")
+        if document is None:
+            raise NotFoundError("the child invocation disappeared during resource recovery")
+        check_parent()
+        return ChildInvocation.from_dict(document)
 
     def set_cleanup_state(
         self, invocation: ChildInvocation, *, state: ChildCleanupState, error: str | None = None,
