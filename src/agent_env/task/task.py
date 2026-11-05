@@ -21,9 +21,12 @@ from agent_env.config import run_env_ids
 from agent_env.plugins import _registration
 from agent_env.store.document_store import UnknownDocumentTypeError
 from agent_env.store.routing import run_scope
-from agent_env.task.execution import StepExecution, TaskLifecycleError, executing_step
+from agent_env.task.execution import StepExecution, TaskLifecycleError, TaskPersistenceFailure, executing_step
 from agent_env.task.merge import merge_step_context, retain_step_resources
-from agent_env.task.persistence import DEFAULT_STORE_TIMEOUT_SECONDS, call_store, current_store_deadline, store_deadline
+from agent_env.task.persistence import (
+    DEFAULT_STORE_TIMEOUT_SECONDS, call_store, current_store_deadline, is_task_persistence_required,
+    require_task_persistence, store_deadline,
+)
 from agent_env.task.resources import record_resource_context
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
@@ -426,15 +429,28 @@ class Task:
         completed_step_ids: set[str] | None = None,
         resource_checkpoint: ResourceCheckpoint | None = None,
         resource_checkpoint_timeout_seconds: float = DEFAULT_STORE_TIMEOUT_SECONDS,
+        require_persistence: bool = False,
+        persistence_timeout_seconds: float | None = None,
     ) -> TaskStepContext:
         """Run steps per their depends_on DAG. Per-step `fail_task_on_error`
         (default True) controls halt-on-failure; failures land in
         context.metadata['failed_steps']. The run is scoped to this task's id, so under namespace
         routing an ``@local`` task's records stay in the local stores.
+        ``require_persistence`` makes store failures fatal and is inherited by nested runs.
+        ``persistence_timeout_seconds`` bounds each store call; None inherits the caller's budget or the SDK default.
         """
         if not math.isfinite(resource_checkpoint_timeout_seconds) or resource_checkpoint_timeout_seconds <= 0:
             raise ValueError("resource_checkpoint_timeout_seconds must be finite and positive")
-        with run_scope(self.id), run_env_ids((context.metadata.get("user_overrides") or {}) if context else {}):
+        if persistence_timeout_seconds is not None and (
+            isinstance(persistence_timeout_seconds, bool) or not isinstance(persistence_timeout_seconds, (int, float))
+            or not math.isfinite(persistence_timeout_seconds) or persistence_timeout_seconds <= 0
+        ):
+            raise ValueError("persistence_timeout_seconds must be finite and positive")
+        with (
+            run_scope(self.id),
+            run_env_ids((context.metadata.get("user_overrides") or {}) if context else {}),
+            require_task_persistence(required=require_persistence, timeout_seconds=persistence_timeout_seconds),
+        ):
             return await self._run(
                 on_step_start, on_step_complete, agent_model, agent_artifact_id,
                 start_step, end_step, context, instance_id, completed_step_ids, resource_checkpoint,
@@ -520,6 +536,8 @@ class Task:
                 self.id, self.version, total, start_step,
                 instance_id=instance_id, completed_steps=completed_steps,
             ), deadline=current_store_deadline())
+            if instance is None and is_task_persistence_required():
+                raise TaskPersistenceFailure("Required task registration did not create an instance")
             if instance:
                 context.instance_id = instance.instance_id
                 state.epoch = instance.attempt_epoch
@@ -862,6 +880,8 @@ class Task:
                     first_error if first_error is not None else failure, Task._utc_now_str(), state.epoch,
                 )
             if failure is not exc:
+                if failure.__cause__ is not None:
+                    raise failure
                 raise failure from exc
             raise
 

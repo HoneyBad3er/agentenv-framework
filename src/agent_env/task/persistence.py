@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TypeVar
 
-from agent_env.task.execution import TaskLifecycleError
+from agent_env.task.execution import TaskLifecycleError, TaskPersistenceFailure
 
 DEFAULT_STORE_TIMEOUT_SECONDS = 30.0
 MAX_CONCURRENT_STORE_CALLS = 8
@@ -20,6 +20,10 @@ _STORE_SLOT_POLL_SECONDS = 0.01
 _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STORE_CALLS, thread_name_prefix="agentenv-persistence")
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT_STORE_CALLS)
 _deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("agentenv_store_deadline", default=None)
+_required: contextvars.ContextVar[bool] = contextvars.ContextVar("agentenv_task_persistence_required", default=False)
+_timeout_seconds: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "agentenv_store_timeout_seconds", default=DEFAULT_STORE_TIMEOUT_SECONDS,
+)
 _T = TypeVar("_T")
 
 
@@ -38,6 +42,27 @@ class StoreDeadlineExceeded(TaskLifecycleError, TimeoutError):
 
 class StoreCallAbandoned(TaskLifecycleError):
     """The awaiting task has left this synchronous operation; it must not begin another mutation."""
+
+
+@contextmanager
+def require_task_persistence(*, required: bool, timeout_seconds: float | None = None) -> Iterator[None]:
+    """A nested run inherits its parent's persistence requirement and cannot weaken it."""
+    token = _required.set(required or _required.get())
+    timeout_token = _timeout_seconds.set(timeout_seconds if timeout_seconds is not None else _timeout_seconds.get())
+    try:
+        yield
+    finally:
+        _timeout_seconds.reset(timeout_token)
+        _required.reset(token)
+
+
+def is_task_persistence_required() -> bool:
+    return _required.get()
+
+
+def raise_persistence_failure(error: Exception, *, operation: str) -> None:
+    if is_task_persistence_required():
+        raise TaskPersistenceFailure(f"Required task persistence failed: {operation}") from error
 
 
 def check_store_call() -> None:
@@ -62,7 +87,10 @@ def store_deadline(deadline: float) -> Iterator[None]:
 def current_store_deadline() -> float:
     """Use the execution's deadline, or a bounded call budget for Task.run(), which has no overall deadline."""
     inherited = _deadline.get()
-    return inherited if inherited is not None else asyncio.get_running_loop().time() + DEFAULT_STORE_TIMEOUT_SECONDS
+    if inherited is not None and _call.get() is not None:
+        return inherited
+    deadline = asyncio.get_running_loop().time() + _timeout_seconds.get()
+    return min(inherited, deadline) if inherited is not None else deadline
 
 
 def _observe_future(future: asyncio.Future) -> None:
@@ -78,6 +106,7 @@ def _invoke(operation: Callable[[], _T]) -> _T:
 async def call_store(operation: Callable[[], _T], *, deadline: float) -> _T:
     """Preserve contextvars off-loop; a slot stays occupied until the backend call actually stops, even after timeout."""
     loop = asyncio.get_running_loop()
+    deadline = min(deadline, loop.time() + _timeout_seconds.get())
     if deadline <= loop.time():
         raise StoreDeadlineExceeded("persistence deadline expired before the call started")
     active = _StoreCall(deadline=time.monotonic() + deadline - loop.time(), abandoned=threading.Event())
@@ -91,6 +120,7 @@ async def call_store(operation: Callable[[], _T], *, deadline: float) -> _T:
                     raise StoreDeadlineExceeded("persistence deadline expired while waiting for capacity")
                 context = contextvars.copy_context()
                 context.run(_call.set, active)
+                context.run(_deadline.set, deadline)
                 pending = _executor.submit(context.run, _invoke, operation)
             except BaseException:
                 _slots.release()

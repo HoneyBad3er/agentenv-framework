@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Callable
 from functools import partial
+from typing import NoReturn, TypeVar
 
 from agent_env.runner.runner import RunStatus, run_outcome
 from agent_env.store.base import NotFoundError
 from agent_env.store.routing import run_scope
 from agent_env.task.child_store import ChildCleanupState, ChildInvocation, get_child_invocation_store
-from agent_env.task.execution import StepExecution, TaskLifecycleError, current_step_execution
-from agent_env.task.persistence import call_store, current_store_deadline, store_deadline
+from agent_env.task.execution import StepExecution, TaskLifecycleError, TaskPersistenceFailure, current_step_execution
+from agent_env.task.persistence import (
+    call_store, current_store_deadline, is_task_persistence_required, raise_persistence_failure, store_deadline,
+)
 from agent_env.task.recovery import merge_resource_contexts, pending_resource_context
 from agent_env.task.resources import load_resource_context
 from agent_env.task.store import SupersededAttemptError, TaskStepStatus, get_task_instance_store
@@ -38,8 +42,22 @@ class ChildCleanupFailure(ChildTaskFailed, TaskLifecycleError):
     """Child resources could not be confirmed terminated."""
 
 
+_T = TypeVar("_T")
+
+
+async def _call_nested_store(operation: Callable[[], _T], *, deadline: float) -> _T:
+    try:
+        return await call_store(operation, deadline=deadline)
+    except (SupersededAttemptError, TaskLifecycleError):
+        raise
+    except Exception as error:
+        raise_persistence_failure(error, operation="persist nested task invocation")
+        raise
+
+
 def _initial_context(
     *, parent: TaskStepContext, inputs: dict, execution: StepExecution, generation: int, iteration: int,
+    invocation_name: str | None,
 ) -> TaskStepContext:
     metadata = copy.deepcopy(inputs)
     metadata["user_overrides"] = copy.deepcopy(parent.metadata.get("user_overrides") or {})
@@ -49,6 +67,7 @@ def _initial_context(
         "step_id": execution.step_id,
         "step_generation": generation,
         "iteration": iteration,
+        "invocation_name": invocation_name,
     }
     for key in ("workflow_id", "run_group_id"):
         if key in parent.metadata:
@@ -80,6 +99,11 @@ async def _restore_context(
             instance = await call_store(partial(get_task_instance_store().get, invocation.child_instance_id), deadline=deadline)
     except NotFoundError:
         return initial, set(), False, False
+    except (SupersededAttemptError, TaskLifecycleError):
+        raise
+    except Exception as error:
+        raise_persistence_failure(error, operation="restore child task instance")
+        raise
     if instance.task_id != task.id or instance.task_version != task.version:
         raise ChildTaskFailed(invocation.child_instance_id, "stored task identity changed")
     restored = copy.deepcopy(instance.context or {})
@@ -95,7 +119,7 @@ async def _restore_context(
         return initial, set(), False, True
     retained = _completed_dependencies(task, completed)
     with run_scope(task.id):
-        restored = await call_store(partial(
+        restored = await _call_nested_store(partial(
             get_task_instance_store().replay_completed_context_sync, invocation.child_instance_id, retained,
         ), deadline=deadline)
     regraft_redacted_keys(initial.to_dict(), restored)
@@ -116,16 +140,27 @@ async def _clean_child(
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     recording_error: Exception | None = None
     try:
-        invocation = await call_store(partial(
+        invocation = await _call_nested_store(partial(
             store.capture_cleanup_context, invocation, context=context.to_safe_dict(),
         ), deadline=deadline)
-        invocation = await call_store(partial(
+        invocation = await _call_nested_store(partial(
             store.set_cleanup_state, invocation, state=ChildCleanupState.RUNNING,
         ), deadline=deadline)
     except SupersededAttemptError:
         raise
     except Exception as error:
         recording_error = error
+
+    def raise_cleanup_cancellation(
+        cancellation: asyncio.CancelledError, *, cleanup_failure: ChildCleanupFailure | None = None,
+    ) -> NoReturn:
+        if is_task_persistence_required() and recording_error is not None:
+            failures = ((cancellation, recording_error) if cleanup_failure is None
+                        else (cancellation, recording_error, cleanup_failure))
+            raise TaskPersistenceFailure("Child cleanup was cancelled after required persistence failed") from BaseExceptionGroup(
+                "Child cleanup cancellation and persistence failure", failures,
+            )
+        raise cancellation
 
     async def clean() -> None:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -140,13 +175,13 @@ async def _clean_child(
         )
 
     cleaning = asyncio.create_task(clean())
-    cancelled = False
+    cancellation: asyncio.CancelledError | None = None
     try:
         while not cleaning.done():
             try:
                 await asyncio.shield(cleaning)
-            except asyncio.CancelledError:
-                cancelled = True
+            except asyncio.CancelledError as error:
+                cancellation = error
         cleaning.result()
     except BaseException as error:
         failure = error if isinstance(error, ChildCleanupFailure) else ChildCleanupFailure(
@@ -154,12 +189,14 @@ async def _clean_child(
         )
         try:
             report_deadline = asyncio.get_running_loop().time() + timeout_seconds
-            invocation = await call_store(partial(
+            invocation = await _call_nested_store(partial(
                 store.capture_cleanup_context, invocation, context=context.to_safe_dict(),
             ), deadline=report_deadline)
-            await call_store(partial(
+            await _call_nested_store(partial(
                 store.set_cleanup_state, invocation, state=ChildCleanupState.FAILED, error=str(failure),
             ), deadline=report_deadline)
+        except asyncio.CancelledError as cancellation:
+            raise_cleanup_cancellation(cancellation, cleanup_failure=failure)
         except Exception as persistence_error:
             failure.add_note(f"Recording failed cleanup also failed: {type(persistence_error).__name__}")
         if recording_error is not None:
@@ -169,34 +206,40 @@ async def _clean_child(
         raise failure from error
     try:
         report_deadline = asyncio.get_running_loop().time() + timeout_seconds
-        invocation = await call_store(partial(
+        invocation = await _call_nested_store(partial(
             store.capture_cleanup_context, invocation, context=context.to_safe_dict(),
         ), deadline=report_deadline)
-        invocation = await call_store(partial(
+        invocation = await _call_nested_store(partial(
             store.set_cleanup_state, invocation, state=ChildCleanupState.COMPLETED,
         ), deadline=report_deadline)
     except SupersededAttemptError:
         raise
+    except asyncio.CancelledError as error:
+        raise_cleanup_cancellation(error)
     except Exception as error:
         raise ChildCleanupFailure(invocation.child_instance_id, "completed teardown could not be recorded") from error
-    if cancelled:
-        raise asyncio.CancelledError
+    if cancellation is not None:
+        raise_cleanup_cancellation(cancellation)
+    if is_task_persistence_required() and recording_error is not None:
+        raise recording_error
     return invocation
 
 
 async def run_child(
     *, step: TaskStep, context: TaskStepContext, task: dict, inputs: dict, iteration: int,
     child_timeout_seconds: float, cleanup_timeout_seconds: float,
+    invocation_name: str | None = None,
 ) -> TaskStepContext:
     execution = current_step_execution()
     if execution.instance_id != context.instance_id or execution.step_id != step.id:
         raise RuntimeError("Nested task parent does not match the executing step")
     deadline = asyncio.get_running_loop().time() + child_timeout_seconds
-    parent = await call_store(partial(get_task_instance_store().get, execution.instance_id), deadline=deadline)
+    parent = await _call_nested_store(partial(get_task_instance_store().get, execution.instance_id), deadline=deadline)
     store = get_child_invocation_store()
     initial = _initial_context(
         parent=context, inputs=inputs, execution=execution,
         generation=parent.child_step_generations.get(step.id, 0), iteration=iteration,
+        invocation_name=invocation_name,
     )
     captured_context = initial.to_safe_dict()
     for key in ("workflow_id", "run_group_id"):
@@ -205,11 +248,12 @@ async def run_child(
         "context": captured_context, "child_timeout_seconds": child_timeout_seconds,
         "cleanup_timeout_seconds": cleanup_timeout_seconds,
     }
-    invocation = await call_store(partial(store.get_or_create,
+    invocation = await _call_nested_store(partial(store.get_or_create,
         parent_instance_id=execution.instance_id, parent_step_id=step.id,
         parent_step_generation=parent.child_step_generations.get(step.id, 0),
         parent_attempt_epoch=execution.attempt_epoch, iteration=iteration,
         task_definition=task, captured_inputs=captured,
+        invocation_name=invocation_name,
     ), deadline=deadline)
     child_task = Task.from_dict(invocation.task_definition)
     child_context = initial
@@ -220,7 +264,7 @@ async def run_child(
     async def checkpoint_resources(resource_context: TaskStepContext) -> None:
         nonlocal invocation, cleanup_context
         cleanup_context = merge_resource_contexts(cleanup_context, resource_context)
-        invocation = await call_store(partial(
+        invocation = await _call_nested_store(partial(
             store.capture_cleanup_context, invocation, context=cleanup_context.to_safe_dict(),
         ), deadline=current_store_deadline())
 
@@ -234,7 +278,7 @@ async def run_child(
                 restart and invocation.cleanup_state is not ChildCleanupState.COMPLETED
             ):
                 with run_scope(child_task.id):
-                    previous = await call_store(partial(
+                    previous = await _call_nested_store(partial(
                         get_task_instance_store().get, invocation.child_instance_id,
                     ), deadline=deadline)
                 previous_context = TaskStepContext.from_dict(copy.deepcopy(previous.context or {}))
@@ -246,12 +290,12 @@ async def run_child(
             if restart:
                 with run_scope(child_task.id):
                     instances = get_task_instance_store()
-                    previous = await call_store(partial(instances.get, invocation.child_instance_id), deadline=deadline)
-                    await call_store(partial(instances.undo_steps_sync,
+                    previous = await _call_nested_store(partial(instances.get, invocation.child_instance_id), deadline=deadline)
+                    await _call_nested_store(partial(instances.undo_steps_sync,
                         invocation.child_instance_id, {child_step.id for child_step in child_task.steps},
                         bump_epoch=True, attempt_epoch=previous.attempt_epoch,
                     ), deadline=deadline)
-            invocation = await call_store(partial(
+            invocation = await _call_nested_store(partial(
                 store.set_cleanup_state, invocation, state=ChildCleanupState.PENDING,
             ), deadline=deadline)
             try:
@@ -269,7 +313,9 @@ async def run_child(
         status, reason = run_outcome(child_context)
         if status is not RunStatus.COMPLETED:
             raise ChildTaskFailed(invocation.child_instance_id, reason or "child graph failed")
-        invocation = await call_store(partial(store.complete, invocation, outcome=child_context.to_safe_dict()), deadline=deadline)
+        invocation = await _call_nested_store(
+            partial(store.complete, invocation, outcome=child_context.to_safe_dict()), deadline=deadline,
+        )
     except asyncio.CancelledError as error:
         primary = error
         raise

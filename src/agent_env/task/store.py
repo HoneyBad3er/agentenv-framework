@@ -30,8 +30,11 @@ from agent_env.task.step_journal import (
     replay_context,
 )
 from agent_env.task_step.context import TaskStepContext
-from agent_env.task.execution import TaskLifecycleError
-from agent_env.task.persistence import StoreDeadlineExceeded, call_store, check_store_call, current_store_deadline
+from agent_env.task.execution import TaskLifecycleError, TaskPersistenceFailure
+from agent_env.task.persistence import (
+    StoreDeadlineExceeded, call_store, check_store_call, current_store_deadline, is_task_persistence_required,
+    raise_persistence_failure,
+)
 
 if TYPE_CHECKING:
     from agent_env.task.task import Task
@@ -536,7 +539,8 @@ class TaskInstanceStore:
                 self._journal_step(store, instance_id, c["step_id"], ContextUpdateOps(), c["status"], attempt_epoch=attempt_epoch)
             except TaskLifecycleError:
                 raise
-            except Exception:
+            except Exception as error:
+                raise_persistence_failure(error, operation="journal seeded step")
                 logger.warning("Failed to journal seeded step %s for instance_id=%s",
                                c["step_id"], instance_id, exc_info=True)
 
@@ -712,7 +716,8 @@ class TaskInstanceStore:
                                    attempt_epoch=result.get("attempt_epoch", 0))
             except TaskLifecycleError:
                 raise
-            except Exception:
+            except Exception as error:
+                raise_persistence_failure(error, operation="journal scheduler rollback")
                 logger.warning("Failed to journal the scheduler record for instance_id=%s", instance_id, exc_info=True)
         return result
 
@@ -729,7 +734,7 @@ class TaskInstanceStore:
         end) and derive ``current_step``/``status`` under an optimistic compare-and-swap on
         ``rev`` (retried).
 
-        Journal first but fail open: a failed journal write is logged and the completion still
+        A journal failure is fatal when persistence is required. Otherwise the completion still
         lands, leaving a completion with no entry, which is what undo refuses to replay over.
         The CAS is bound to the generation captured while journaling, so a completion from a run
         a re-register superseded is declined rather than joining the fresh one.
@@ -755,12 +760,15 @@ class TaskInstanceStore:
             )
         except TaskLifecycleError:
             raise
-        except Exception:
+        except Exception as error:
+            raise_persistence_failure(error, operation="journal step completion")
             logger.warning(
                 "Failed to journal step %s for instance_id=%s; completing without an undo record",
                 step_id, instance_id, exc_info=True,
             )
             journaled = None
+        if journaled is None and is_task_persistence_required():
+            raise TaskPersistenceFailure(f"Required completion journal was not recorded for step {step_id!r}")
         seq, journaled_generation = journaled if journaled is not None else (None, None)
         declined: list[str] = []  # why the deciding _mutate refused, if it did
 
@@ -819,6 +827,8 @@ class TaskInstanceStore:
             error = SupersededAttemptError(instance_id, step_id, declined[0])
             logger.warning("%s", error)
             raise error
+        if result is None and is_task_persistence_required():
+            raise TaskPersistenceFailure(f"Required completion was not recorded for step {step_id!r}")
 
     def record_task_failure_sync(
         self,
@@ -939,7 +949,7 @@ def register_task_instance(
     """Register a task_instance row.
 
     With ``instance_id``: idempotent upsert, and a failure raises, since the caller already handed that id out.
-    Without: random-id insert, and a failure is logged and the run goes unrecorded.
+    Without: random-id insert, and a failure is logged and the run goes unrecorded unless persistence is required.
 
     Re-registering an existing instance advances its ``attempt_epoch``. A caller that dispatches the run's steps itself
     must record them under the returned instance's ``attempt_epoch``; an older one raises ``SupersededAttemptError``.
@@ -960,7 +970,8 @@ def register_task_instance(
         )
     except (SupersededAttemptError, TaskLifecycleError):
         raise
-    except Exception:
+    except Exception as error:
+        raise_persistence_failure(error, operation="register task instance")
         if instance_id is not None:
             raise
         logger.warning("Failed to create task instance record", exc_info=True)
@@ -983,7 +994,8 @@ def seed_task_instance_context(
         get_task_instance_store().seed_context(instance_id, ops, attempt_epoch=attempt_epoch)
     except (SupersededAttemptError, TaskLifecycleError):
         raise
-    except Exception:
+    except Exception as error:
+        raise_persistence_failure(error, operation="seed task context")
         if attempt_epoch is not None:
             raise
         logger.warning("Failed to seed task instance context", exc_info=True)
@@ -1005,7 +1017,7 @@ async def record_step_complete(
     entries; ``completed_steps`` keeps first-appearance order. ``attempt_epoch``
     fences a write from a rolled-back attempt (see ``record_step_complete_sync``).
 
-    A store error is logged, not raised. A completion a later attempt fenced off raises
+    A store error is fatal when persistence is required and otherwise logged. A completion a later attempt fenced off raises
     ``SupersededAttemptError``: retrying it cannot land, so a dispatcher should end the step.
     """
     entry = dataclasses.asdict(TaskStepResult(step_id=step_id, status=status))
@@ -1016,7 +1028,8 @@ async def record_step_complete(
         ), deadline=current_store_deadline())
     except (SupersededAttemptError, TaskLifecycleError):
         raise
-    except Exception:
+    except Exception as error:
+        raise_persistence_failure(error, operation="record step completion")
         logger.error(
             "Failed to record step complete for instance_id=%s step_id=%s",
             instance_id, step_id, exc_info=True,
@@ -1031,7 +1044,7 @@ async def undo_steps(
     bump_epoch: bool = False,
     attempt_epoch: int | None = None,
 ) -> dict | None:
-    """Async ``TaskInstanceStore.undo_steps_sync``; None if the instance is missing or the
+    """Async ``TaskInstanceStore.undo_steps_sync``; None if the instance is missing or an optional
     write failed (logged). A refusal propagates: the store is saying it cannot rebuild that
     context, and a caller that re-dispatched anyway would run the span on a dirty one."""
     try:
@@ -1041,7 +1054,8 @@ async def undo_steps(
         ), deadline=current_store_deadline())
     except (ValueError, SupersededAttemptError, TaskLifecycleError):
         raise
-    except Exception:
+    except Exception as error:
+        raise_persistence_failure(error, operation="undo task steps")
         logger.error("Failed to undo steps %s for instance_id=%s", sorted(step_ids), instance_id, exc_info=True)
         return None
 
@@ -1050,10 +1064,10 @@ _FAILURE_WRITE_MAX_ATTEMPTS = 3
 _FAILURE_WRITE_BACKOFF_SECONDS = 0.5
 
 
-async def _retry_store_write(operation: Callable[[], None]) -> BaseException | None:
+async def _retry_store_write(operation: Callable[[], None]) -> Exception | None:
     deadline = current_store_deadline()
     budget = asyncio.timeout_at(deadline)
-    last_error: BaseException | None = None
+    last_error: Exception | None = None
     try:
         async with budget:
             for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
@@ -1097,6 +1111,7 @@ async def record_task_failure(
     ))
     if last_exc is None:
         return
+    raise_persistence_failure(last_exc, operation="record task failure")
     logger.warning(
         "Failed to record task failure after %d attempts; the task instance record "
         "will not show it",
@@ -1107,10 +1122,10 @@ async def record_task_failure(
 
 
 def record_task_cancelled(instance_id: str, reason: str, completed_at_utc: str, attempt_epoch: int | None = None) -> None:
-    """Write a cancelled run's terminal state, retried like ``record_task_failure``. It logs a write that keeps
-    failing rather than raising. Synchronous: ``run_bundle`` calls it once its event loop has closed."""
+    """Write a cancelled run's terminal state, retried like ``record_task_failure``. A persistent write failure
+    raises when persistence is required, otherwise logs. ``run_bundle`` also calls this once its event loop has closed."""
     store = get_task_instance_store()
-    last_exc: BaseException | None = None
+    last_exc: Exception | None = None
     for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
         try:
             store.record_task_cancelled_sync(instance_id, reason, completed_at_utc, attempt_epoch)
@@ -1121,18 +1136,19 @@ def record_task_cancelled(instance_id: str, reason: str, completed_at_utc: str, 
             last_exc = exc
             if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
                 time.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
+    if last_exc is not None:
+        raise_persistence_failure(last_exc, operation="record task cancellation")
     logger.warning(
         "Failed to record the cancellation of instance_id=%s after %d attempts",
         instance_id, _FAILURE_WRITE_MAX_ATTEMPTS, exc_info=last_exc,
     )
 
-# Best-effort, diagnostic-only wrapper around ``append_step_attempt_failure_sync``: retries a
-# transient write (like ``record_task_failure``), then logs and swallows — never raises.
 async def append_step_attempt_failure(instance_id: str, failure: "StepAttemptFailure") -> None:
     store = get_task_instance_store()
     last_exc = await _retry_store_write(partial(store.append_step_attempt_failure_sync, instance_id, failure))
     if last_exc is None:
         return
+    raise_persistence_failure(last_exc, operation="append step attempt failure")
     logger.warning(
         "Failed to append attempt-failure ledger entry for instance_id=%s after %d attempts",
         instance_id, _FAILURE_WRITE_MAX_ATTEMPTS, exc_info=last_exc,

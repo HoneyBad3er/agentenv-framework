@@ -12,12 +12,13 @@ from enum import StrEnum
 from agent_env.config import get_config
 from agent_env.store.base import NotFoundError
 from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Sort, SortKey, UpdateSpec, compare_and_swap
+from agent_env.task.persistence import check_store_call
 from agent_env.task.store import TASK_INSTANCES_COLLECTION, SupersededAttemptError, TaskInstance
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.teardown_sandboxes import TORN_DOWN_KEY
 
 TASK_CHILD_INVOCATIONS_COLLECTION = "task_child_invocations"
-_KEY_FIELDS = ["parent_instance_id", "parent_step_id", "parent_step_generation", "iteration"]
+_KEY_FIELDS = ["parent_instance_id", "parent_step_id", "parent_step_generation", "invocation_name", "iteration"]
 
 
 class ChildInvocationConflict(ValueError):
@@ -29,6 +30,11 @@ class ChildCleanupState(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+def _validate_invocation_name(invocation_name: str | None) -> None:
+    if invocation_name is not None and (not isinstance(invocation_name, str) or not invocation_name.strip()):
+        raise ValueError("invocation_name must be a nonempty string when provided")
 
 
 def _json_snapshot(value: dict) -> dict:
@@ -58,12 +64,14 @@ class ChildInvocation:
     cleanup_state: ChildCleanupState = ChildCleanupState.PENDING
     cleanup_error: str | None = None
     rev: int = 0
+    invocation_name: str = ""
 
     def to_dict(self) -> dict:
         return copy.deepcopy({
             "parent_instance_id": self.parent_instance_id, "parent_step_id": self.parent_step_id,
             "parent_step_generation": self.parent_step_generation, "parent_attempt_epoch": self.parent_attempt_epoch,
             "iteration": self.iteration, "child_instance_id": self.child_instance_id,
+            "invocation_name": self.invocation_name,
             "task_definition": self.task_definition, "captured_inputs": self.captured_inputs,
             "outcome": self.outcome, "cleanup_context": self.cleanup_context,
             "cleanup_state": str(self.cleanup_state), "cleanup_error": self.cleanup_error,
@@ -77,6 +85,7 @@ class ChildInvocation:
             parent_step_generation=document["parent_step_generation"], parent_attempt_epoch=document["parent_attempt_epoch"],
             iteration=document["iteration"], child_instance_id=document["child_instance_id"],
             task_definition=copy.deepcopy(document["task_definition"]), captured_inputs=copy.deepcopy(document["captured_inputs"]),
+            invocation_name=document["invocation_name"],
             outcome=copy.deepcopy(document.get("outcome")), cleanup_context=copy.deepcopy(document.get("cleanup_context")),
             cleanup_state=ChildCleanupState(document["cleanup_state"]),
             cleanup_error=document.get("cleanup_error"), rev=document.get("rev", 0),
@@ -91,14 +100,19 @@ class ChildInvocationStore:
     def _doc_store(self) -> DocumentStore:
         store = get_config().get_document_store()
         if self._indexed is not store:
+            check_store_call()
             store.ensure_index(TASK_CHILD_INVOCATIONS_COLLECTION, _KEY_FIELDS, unique=True)
+            check_store_call()
             store.ensure_index(TASK_CHILD_INVOCATIONS_COLLECTION, ["child_instance_id"], unique=True)
+            check_store_call()
             store.ensure_index(TASK_CHILD_INVOCATIONS_COLLECTION, ["parent_instance_id"])
             self._indexed = store
         return store
 
     def _check_parent(self, store: DocumentStore, invocation: ChildInvocation) -> None:
+        check_store_call()
         document = store.find_one(TASK_INSTANCES_COLLECTION, Filter.of(instance_id=invocation.parent_instance_id))
+        check_store_call()
         if document is None:
             raise NotFoundError(f"TaskInstance {invocation.parent_instance_id!r} not found")
         parent = TaskInstance.from_dict(document)
@@ -111,7 +125,8 @@ class ChildInvocationStore:
 
     def _key(self, invocation: ChildInvocation) -> Filter:
         return Filter.of(parent_instance_id=invocation.parent_instance_id, parent_step_id=invocation.parent_step_id,
-                         parent_step_generation=invocation.parent_step_generation, iteration=invocation.iteration)
+                         parent_step_generation=invocation.parent_step_generation, invocation_name=invocation.invocation_name,
+                         iteration=invocation.iteration)
 
     def _check_identity(self, current: ChildInvocation, expected: ChildInvocation) -> None:
         if (not _same_json(current.task_definition, expected.task_definition)
@@ -121,17 +136,22 @@ class ChildInvocationStore:
     def get_or_create(
         self, *, parent_instance_id: str, parent_step_id: str, parent_step_generation: int,
         parent_attempt_epoch: int, iteration: int, task_definition: dict, captured_inputs: dict,
+        invocation_name: str | None = None,
     ) -> ChildInvocation:
+        _validate_invocation_name(invocation_name)
         candidate = ChildInvocation(
             parent_instance_id=parent_instance_id, parent_step_id=parent_step_id,
             parent_step_generation=parent_step_generation, parent_attempt_epoch=parent_attempt_epoch, iteration=iteration,
             child_instance_id=f"{parent_instance_id}/child-{uuid.uuid4().hex}", task_definition=_json_snapshot(task_definition),
             captured_inputs=_json_snapshot(captured_inputs),
+            invocation_name=invocation_name if invocation_name is not None else "",
         )
         store = self._doc_store
         self._check_parent(store, candidate)
         try:
-            store.insert(TASK_CHILD_INVOCATIONS_COLLECTION, candidate.to_dict())
+            candidate_document = candidate.to_dict()
+            check_store_call()
+            store.insert(TASK_CHILD_INVOCATIONS_COLLECTION, candidate_document)
         except DuplicateKeyError:
             def adopt(document: dict) -> UpdateSpec:
                 self._check_parent(store, candidate)
@@ -139,6 +159,7 @@ class ChildInvocationStore:
                 self._check_identity(current, candidate)
                 if current.parent_attempt_epoch > parent_attempt_epoch:
                     raise SupersededAttemptError(parent_instance_id, parent_step_id, "another attempt owns the child invocation")
+                check_store_call()
                 return UpdateSpec(set={"parent_attempt_epoch": parent_attempt_epoch})
 
             document = compare_and_swap(store, TASK_CHILD_INVOCATIONS_COLLECTION, self._key(candidate),
@@ -152,10 +173,13 @@ class ChildInvocationStore:
     def get(
         self, *, parent_instance_id: str, parent_step_id: str, parent_step_generation: int,
         parent_attempt_epoch: int, iteration: int,
+        invocation_name: str | None = None,
     ) -> ChildInvocation | None:
+        _validate_invocation_name(invocation_name)
         expected = ChildInvocation(parent_instance_id=parent_instance_id, parent_step_id=parent_step_id,
                                    parent_step_generation=parent_step_generation, parent_attempt_epoch=parent_attempt_epoch,
-                                   iteration=iteration, child_instance_id="", task_definition={}, captured_inputs={})
+                                   iteration=iteration, child_instance_id="", task_definition={}, captured_inputs={},
+                                   invocation_name=invocation_name if invocation_name is not None else "")
         store = self._doc_store
         self._check_parent(store, expected)
         document = store.find_one(TASK_CHILD_INVOCATIONS_COLLECTION, self._key(expected))
@@ -169,6 +193,7 @@ class ChildInvocationStore:
         documents = self._doc_store.query(
             TASK_CHILD_INVOCATIONS_COLLECTION, match,
             sort=Sort((SortKey("parent_step_id", descending=False), SortKey("parent_step_generation", descending=False),
+                       SortKey("invocation_name", descending=False),
                        SortKey("iteration", descending=False))),
         )
         return [ChildInvocation.from_dict(document) for document in documents]
@@ -184,7 +209,9 @@ class ChildInvocationStore:
                     or current.child_instance_id != invocation.child_instance_id):
                 raise SupersededAttemptError(invocation.parent_instance_id, invocation.parent_step_id,
                                              "another attempt owns the child invocation")
-            return mutate(current)
+            changes = mutate(current)
+            check_store_call()
+            return changes
 
         document = compare_and_swap(store, TASK_CHILD_INVOCATIONS_COLLECTION, self._key(invocation), update, counter_field="rev")
         if document is None:
@@ -233,7 +260,9 @@ class ChildInvocationStore:
         store = self._doc_store
 
         def check_parent() -> None:
+            check_store_call()
             document = store.find_one(TASK_INSTANCES_COLLECTION, Filter.of(instance_id=invocation.parent_instance_id))
+            check_store_call()
             if document is None:
                 raise NotFoundError(f"TaskInstance {invocation.parent_instance_id!r} not found")
             if document.get("attempt_epoch", 0) != parent_attempt_epoch:
@@ -249,6 +278,7 @@ class ChildInvocationStore:
             fields = {"cleanup_state": str(ChildCleanupState(state)), "cleanup_error": error}
             if context is not None:
                 fields["cleanup_context"] = _json_snapshot(TaskStepContext.from_dict(context).to_safe_dict())
+            check_store_call()
             return UpdateSpec(set=fields)
 
         check_parent()

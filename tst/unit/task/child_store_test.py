@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import threading
 import uuid
@@ -12,11 +13,13 @@ import pytest
 from agent_env.config import configure, set_document_store
 from agent_env.store import Filter, LocalSqliteDocumentStore, UpdateSpec
 from agent_env.store.base import ConcurrentModificationError
+from agent_env.store.document_store import Sort
 from agent_env.store.routing import run_scope
 from agent_env.task import Task
 from agent_env.task.child_store import (
     TASK_CHILD_INVOCATIONS_COLLECTION, ChildCleanupState, ChildInvocationConflict, ChildInvocationStore,
 )
+from agent_env.task.persistence import StoreCallAbandoned, StoreDeadlineExceeded, call_store, require_task_persistence
 from agent_env.task.store import (
     TASK_INSTANCES_COLLECTION, TASK_STEP_JOURNAL_COLLECTION, SupersededAttemptError, TaskInstance, TaskInstanceStore,
 )
@@ -25,6 +28,7 @@ from agent_env.task_step.context_ops import ContextUpdateOps
 
 CONTENDING_WRITERS = 8
 THREAD_DEADLINE_SECONDS = 15
+STORE_CALL_TIMEOUT_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,7 @@ def stores(tmp_path) -> Stores:
 def create_child(
     stores: Stores, *, epoch: int = 0, generation: int = 0, iteration: int = 0, step_id: str = "loop",
     task_definition: dict | None = None, captured_inputs: dict | None = None,
+    invocation_name: str | None = None,
 ):
     return stores.children.get_or_create(
         parent_instance_id=stores.parent.instance_id, parent_step_id=step_id,
@@ -55,6 +60,7 @@ def create_child(
         task_definition={"id": "child", "version": 7, "type": "task", "steps": []}
         if task_definition is None else task_definition,
         captured_inputs={"candidate": "captured"} if captured_inputs is None else captured_inputs,
+        invocation_name=invocation_name,
     )
 
 
@@ -320,3 +326,125 @@ def test_resume_replay_rejects_a_failed_step_as_a_retained_completion(stores):
 
     with pytest.raises(ValueError):
         stores.instances.replay_completed_context_sync(stores.parent.instance_id, {"failed"})
+
+
+def test_parallel_named_calls_share_their_own_identity_without_colliding_with_another_name(stores: Stores) -> None:
+    names = ("artifact-review", "construction-review")
+    ready = threading.Barrier(CONTENDING_WRITERS)
+
+    def create(name: str):
+        ready.wait(timeout=THREAD_DEADLINE_SECONDS)
+        return create_child(stores, invocation_name=name, task_definition={"id": name, "version": 1, "steps": []})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONTENDING_WRITERS) as executor:
+        pending = [executor.submit(create, names[index % len(names)]) for index in range(CONTENDING_WRITERS)]
+        invocations = [future.result(timeout=THREAD_DEADLINE_SECONDS) for future in pending]
+
+    assert all(len({invocation.child_instance_id for invocation in invocations if invocation.invocation_name == name}) == 1
+               for name in names)
+    assert len({invocation.child_instance_id for invocation in invocations}) == len(names)
+    assert all(invocation.parent_step_id == "loop" and invocation.iteration == 0 for invocation in invocations)
+    assert stores.documents.count(TASK_CHILD_INVOCATIONS_COLLECTION, Filter()) == len(names)
+
+
+def test_named_children_resume_independently_under_the_actual_owning_steps_new_epoch(stores: Stores) -> None:
+    names = ("artifact-review", "construction-review")
+    children = [create_child(stores, invocation_name=name) for name in names]
+    for child in children:
+        stores.children.complete(child, outcome=TaskStepContext(metadata={"answer": child.invocation_name}).to_safe_dict())
+    parent = stores.instances.upsert_instance(stores.parent.instance_id, "parent", 1, total_steps=3)
+
+    resumed = [create_child(stores, invocation_name=name, epoch=parent.attempt_epoch) for name in names]
+
+    assert [child.child_instance_id for child in resumed] == [child.child_instance_id for child in children]
+    assert [child.outcome["metadata"]["answer"] for child in resumed] == list(names)
+    assert all(child.parent_attempt_epoch == parent.attempt_epoch for child in resumed)
+    reopened = ChildInvocationStore().get(
+        parent_instance_id=stores.parent.instance_id, parent_step_id="loop", parent_step_generation=0,
+        parent_attempt_epoch=parent.attempt_epoch, iteration=0, invocation_name=names[0],
+    )
+    assert reopened == resumed[0]
+
+
+def test_rollback_retires_every_named_child_of_the_owner_and_preserves_another_steps_slot(stores: Stores) -> None:
+    names = ("artifact-review", "construction-review")
+    retired = [create_child(stores, invocation_name=name) for name in names]
+    preserved = create_child(stores, invocation_name=names[0], step_id="sibling")
+    stores.instances.undo_steps_sync(stores.parent.instance_id, {"loop"}, bump_epoch=True, attempt_epoch=0)
+    parent = stores.instances.get(stores.parent.instance_id)
+
+    replacements = [create_child(stores, invocation_name=name, epoch=parent.attempt_epoch, generation=1) for name in names]
+    survivor = create_child(stores, invocation_name=names[0], epoch=parent.attempt_epoch, step_id="sibling")
+
+    assert parent.child_step_generations == {"loop": 1}
+    assert not ({child.child_instance_id for child in replacements} & {child.child_instance_id for child in retired})
+    assert survivor.child_instance_id == preserved.child_instance_id
+    for child in retired:
+        with pytest.raises(SupersededAttemptError):
+            stores.children.complete(child, outcome=TaskStepContext().to_safe_dict())
+
+
+@pytest.mark.parametrize("invocation_name", ["", " ", False, 3])
+def test_child_invocation_names_reject_empty_or_nontext_configuration(stores: Stores, invocation_name) -> None:
+    with pytest.raises(ValueError, match="invocation_name"):
+        create_child(stores, invocation_name=invocation_name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_name", ["create", "adopt", "complete", "recover"])
+async def test_abandoned_child_store_call_never_mutates_its_ledger_after_a_blocked_parent_read_returns(
+    stores: Stores, monkeypatch: pytest.MonkeyPatch, operation_name: str,
+) -> None:
+    previous = None if operation_name == "create" else create_child(stores)
+    epoch = (stores.instances.upsert_instance(stores.parent.instance_id, "parent", 1, total_steps=3).attempt_epoch
+             if operation_name == "adopt" else stores.parent.attempt_epoch)
+    entered, released, finished = threading.Event(), threading.Event(), threading.Event()
+    late_errors: list[BaseException] = []
+    find = stores.documents.find_one
+    parent_reads = 0
+    blocked_read = 1 if operation_name == "create" else 2
+
+    def read_document(collection: str, filter: Filter, sort: Sort | None = None) -> dict | None:
+        nonlocal parent_reads
+        document = find(collection, filter, sort=sort)
+        if collection == TASK_INSTANCES_COLLECTION:
+            parent_reads += 1
+            if parent_reads == blocked_read:
+                entered.set()
+                if not released.wait(THREAD_DEADLINE_SECONDS):
+                    raise AssertionError("the fixture did not release its blocked parent read")
+        return document
+
+    monkeypatch.setattr(stores.documents, "find_one", read_document)
+
+    def persist() -> None:
+        try:
+            if operation_name in ("create", "adopt"):
+                create_child(stores, epoch=epoch)
+            elif previous is not None and operation_name == "complete":
+                stores.children.complete(previous, outcome=TaskStepContext(metadata={"result": "private"}).to_safe_dict())
+            elif previous is not None and operation_name == "recover":
+                stores.children.recover_cleanup_state(previous, parent_attempt_epoch=epoch, state=ChildCleanupState.RUNNING)
+            else:
+                raise AssertionError("the fixture did not prepare the requested child operation")
+        except BaseException as error:
+            late_errors.append(error)
+            raise
+        finally:
+            finished.set()
+
+    with require_task_persistence(required=True):
+        pending = asyncio.create_task(call_store(
+            persist, deadline=asyncio.get_running_loop().time() + STORE_CALL_TIMEOUT_SECONDS,
+        ))
+        try:
+            assert await asyncio.to_thread(entered.wait, THREAD_DEADLINE_SECONDS)
+            with pytest.raises(StoreDeadlineExceeded):
+                await pending
+        finally:
+            released.set()
+            assert await asyncio.to_thread(finished.wait, THREAD_DEADLINE_SECONDS)
+            await asyncio.gather(pending, return_exceptions=True)
+
+    assert len(late_errors) == 1 and isinstance(late_errors[0], StoreCallAbandoned)
+    assert stores.children.list_for_parent(stores.parent.instance_id) == ([] if previous is None else [previous])

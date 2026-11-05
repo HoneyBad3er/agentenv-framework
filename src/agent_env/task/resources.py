@@ -9,7 +9,8 @@ from agent_env.config import get_config
 from agent_env.store.document_store import Filter, UpdateSpec
 from agent_env.store.routing import run_scope
 from agent_env.task.merge import retain_step_resources
-from agent_env.task.persistence import call_store
+from agent_env.task.execution import TaskLifecycleError
+from agent_env.task.persistence import call_store, raise_persistence_failure
 from agent_env.task.store import TASK_INSTANCES_COLLECTION, SupersededAttemptError
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.resource_tracking import TORN_DOWN_RESOURCE_KEY
@@ -41,7 +42,13 @@ async def record_resource_context(context: TaskStepContext, *, attempt_epoch: in
             or context.metadata.get(TORN_DOWN_RESOURCE_KEY) or context.metadata.get("agent_changelog")):
         snapshot = copy.deepcopy(context)
         with run_scope(context.instance_id):
-            await call_store(partial(_record_resource_context, snapshot, attempt_epoch=attempt_epoch), deadline=deadline)
+            try:
+                await call_store(partial(_record_resource_context, snapshot, attempt_epoch=attempt_epoch), deadline=deadline)
+            except (SupersededAttemptError, TaskLifecycleError):
+                raise
+            except Exception as error:
+                raise_persistence_failure(error, operation="record resource ownership")
+                raise
 
 
 def _load_resource_context(instance_id: str) -> TaskStepContext:
@@ -56,4 +63,10 @@ def _load_resource_context(instance_id: str) -> TaskStepContext:
 
 async def load_resource_context(instance_id: str, *, deadline: float) -> TaskStepContext:
     with run_scope(instance_id):
-        return await call_store(partial(_load_resource_context, instance_id), deadline=deadline)
+        try:
+            return await call_store(partial(_load_resource_context, instance_id), deadline=deadline)
+        except (SupersededAttemptError, TaskLifecycleError):
+            raise
+        except Exception as error:
+            raise_persistence_failure(error, operation="load resource ownership")
+            raise

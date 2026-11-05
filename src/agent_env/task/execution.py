@@ -12,6 +12,10 @@ class TaskLifecycleError(RuntimeError):
     """A task cannot safely retry or tolerate an incomplete resource lifecycle."""
 
 
+class TaskPersistenceFailure(TaskLifecycleError):
+    """A required task persistence operation failed before its results could be published."""
+
+
 class ContextWriteConflict(TaskLifecycleError):
     """Concurrent steps proposed incompatible writes to the same context path."""
 
