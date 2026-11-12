@@ -203,6 +203,20 @@ async def test_default_commit_policy_still_publishes_outputs_and_runs_dependents
 
 
 @pytest.mark.asyncio
+async def test_default_seed_policy_still_runs_after_store_error(
+    persistence_documents: LocalSqliteDocumentStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inject_store_failure(
+        persistence_documents, monkeypatch, stage="seed", failure=RuntimeError("backend refused the write"),
+    )
+
+    result = await build_probe_task().run(context=TaskStepContext(metadata={"initial": "seed"}))
+
+    assert PersistenceProbeStep.calls == ["write", "dependent"]
+    assert result.metadata["write"] == "published" and result.metadata["dependent"] == "published"
+
+
+@pytest.mark.asyncio
 async def test_required_registration_failure_stops_before_any_step_and_does_not_leak_into_later_runs(
     persistence_documents: LocalSqliteDocumentStore, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -237,7 +251,47 @@ async def test_required_seed_failure_preserves_cause_and_stops_before_any_step(
 
     assert failure.value.__cause__ is original
     assert PersistenceProbeStep.calls == []
-    assert get_task_instance_store().get(context.instance_id).status != "completed"
+    instance = get_task_instance_store().get(context.instance_id)
+    assert instance.status == "failed"
+    assert instance.completed_steps == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_failure_write_retry_preserves_seed_error_and_terminal_status(
+    persistence_documents: LocalSqliteDocumentStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("seed update failed")
+    inject_store_failure(persistence_documents, monkeypatch, stage="seed", failure=original)
+    update = persistence_documents.update
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    failed_once = False
+
+    def update_document(collection, filter, changes):
+        nonlocal failed_once
+        if changes.set.get("status") == "failed" and not failed_once:
+            failed_once = True
+            loop.call_soon_threadsafe(entered.set)
+            raise ConnectionError("temporary backend failure")
+        return update(collection, filter, changes)
+
+    monkeypatch.setattr(persistence_documents, "update", update_document)
+    context = TaskStepContext(metadata={"initial": "seed"})
+    running = asyncio.create_task(build_probe_task().run(context=context, require_persistence=True))
+    try:
+        async with asyncio.timeout(TEST_DEADLINE_SECONDS):
+            await entered.wait()
+            running.cancel()
+            with pytest.raises(TaskPersistenceFailure) as failure:
+                await running
+    finally:
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+    assert failure.value.__cause__ is original
+    assert PersistenceProbeStep.calls == []
+    assert get_task_instance_store().get(context.instance_id).status == "failed"
 
 
 @pytest.mark.asyncio

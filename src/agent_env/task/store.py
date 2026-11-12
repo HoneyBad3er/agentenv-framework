@@ -996,8 +996,6 @@ def seed_task_instance_context(
         raise
     except Exception as error:
         raise_persistence_failure(error, operation="seed task context")
-        if attempt_epoch is not None:
-            raise
         logger.warning("Failed to seed task instance context", exc_info=True)
 
 

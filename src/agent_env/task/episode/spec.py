@@ -4,7 +4,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from agent_env.task.episode.rules import problems
+from agent_env.task.episode.rules import episode_steps, problems
 from agent_env.task.episode.run import Episode, EpisodeError
 from agent_env.task.episode.steps import _EpisodeAgentStep, _EpisodeTurnStep
 from agent_env.task.task import Task, substitute_seed_in_steps
@@ -56,6 +56,8 @@ class EpisodeSpec:
 
 def _trainer_agents(task: Task, steps: list[TaskStep], named: Sequence[str] | None) -> list[str]:
     prompted = list(dict.fromkeys(step.agent_name for step in steps if step.type == "prompt_agent"))
+    if named is not None or not prompted:
+        prompted = list(dict.fromkeys(step.agent_name for step, _ in episode_steps(steps) if step.type == "prompt_agent"))
     if named is None:
         if len(prompted) != 1:
             raise EpisodeError(

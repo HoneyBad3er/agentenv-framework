@@ -166,6 +166,7 @@ class SubDAGTaskStep(TaskStep):
             inputs=read_metadata(context.metadata, self.input_bindings, field="input_bindings"),
             iteration=0, child_timeout_seconds=self.child_timeout_seconds,
             cleanup_timeout_seconds=self.cleanup_timeout_seconds,
+            step_params=self.step_param_overrides(context).get("child_step_params", {}).get("task"),
         )
         outputs = read_metadata(child_context.metadata, self.output_bindings, field="output_bindings")
         context.metadata.update(outputs)

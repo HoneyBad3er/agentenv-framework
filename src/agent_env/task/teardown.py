@@ -94,21 +94,30 @@ def sandbox_ids(record) -> list[str]:
 
 
 async def teardown_run(context: TaskStepContext, *, timeout: float = TERMINATE_TIMEOUT_SECONDS) -> TeardownReport:
+    """Recover durable ownership when available; still clean known resources when recovery fails."""
     original_context = context
     deadline = asyncio.get_running_loop().time() + timeout
     reports = []
+    errors = []
     if context.instance_id:
-        reports.extend(await recover_child_tree(
-            parent_instance_id=context.instance_id, timeout_seconds=timeout,
-            cleanup=_cleanup_context, deadline=deadline,
-        ))
-        inventory = await load_resource_context(context.instance_id, deadline=deadline)
-        context = merge_resource_contexts(context, inventory)
+        try:
+            reports.extend(await recover_child_tree(
+                parent_instance_id=context.instance_id, timeout_seconds=timeout,
+                cleanup=_cleanup_context, deadline=deadline,
+            ))
+        except Exception as error:
+            errors.append(error)
+        try:
+            inventory = await load_resource_context(context.instance_id, deadline=deadline)
+            context = merge_resource_contexts(context, inventory)
+        except Exception as error:
+            errors.append(error)
     remaining = deadline - asyncio.get_running_loop().time()
-    if remaining <= 0:
+    if remaining <= 0 and not errors:
         reports.append(TeardownReport.skipped(context))
     else:
-        reports.append(await _cleanup_context(context, timeout if context.instance_id is None else remaining))
+        cleanup_timeout = timeout if context.instance_id is None or remaining <= 0 else remaining
+        reports.append(await _cleanup_context(context, cleanup_timeout))
     if TORN_DOWN_KEY in context.metadata:
         original_context.metadata[TORN_DOWN_KEY] = list(context.metadata[TORN_DOWN_KEY])
         if context.instance_id:
@@ -118,8 +127,17 @@ async def teardown_run(context: TaskStepContext, *, timeout: float = TERMINATE_T
                     instance = await call_store(partial(get_task_instance_store().get, context.instance_id), deadline=report_deadline)
                 except NotFoundError:
                     pass
+                except Exception as error:
+                    errors.append(error)
                 else:
-                    await record_resource_context(context, attempt_epoch=instance.attempt_epoch, deadline=report_deadline)
+                    try:
+                        await record_resource_context(context, attempt_epoch=instance.attempt_epoch, deadline=report_deadline)
+                    except Exception as error:
+                        errors.append(error)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise ExceptionGroup("Resource cleanup could not be fully reconciled", errors)
     return TeardownReport(
         terminated=tuple(resource for report in reports for resource in report.terminated),
         failed=tuple(failure for report in reports for failure in report.failed),

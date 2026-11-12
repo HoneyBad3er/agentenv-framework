@@ -366,7 +366,16 @@ def _solver_params(plan: Plan, materialization: Materialization) -> dict[str, di
     written = any(write.kind is BundleKind.AGENT and write.id == plan.agent.agent_id for write in plan.writes)
     version = materialization.version_of(BundleKind.AGENT.store, plan.agent.agent_id) if written else plan.agent.version
     choice = {"a2a_agent_id": plan.agent.agent_id, "a2a_agent_version": version}
-    return {task_id: {step_id: dict(choice) for step_id in steps} for task_id, steps in plan.agent.steps.items()}
+
+    def scoped(tree):
+        return {
+            step_id: dict(choice) if children is None else {
+                "child_step_params": {field: scoped(child) for field, child in children.items()},
+            }
+            for step_id, children in tree.items()
+        }
+
+    return {task_id: scoped(tree) for task_id, tree in plan.agent.step_trees.items()}
 
 
 def _overrides(sandbox: str | None, user_model: str | None, judge_model: str | None) -> dict[str, str]:
@@ -380,9 +389,11 @@ async def _run_all(
     plan: Plan, to_run: list[tuple[BundleEntry, Task]], model: str | None, overrides: dict[str, str],
     step_params: Mapping[str, dict], keep: bool, say: Callable[[str], None], interrupts: Interrupts,
 ) -> tuple[TaskRun, ...]:
+    """Start tasks in selection order, then let their DAGs progress concurrently."""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+    start_lock = asyncio.Lock()
     run_group_id = uuid.uuid4().hex
-    running: set[asyncio.Task] = set()  # the runs holding a slot
+    running: set[asyncio.Task] = set()
 
     async def settle(context: TaskStepContext, cancelled: bool) -> TeardownReport | None:
         """Tear a run down unless it's kept. A second signal stops that."""
@@ -407,13 +418,28 @@ async def _run_all(
         except asyncio.CancelledError:
             return TaskRun(entry, task, context, None, 0.0, cancelled=True, started=False, torn_down=TeardownReport())
         me = asyncio.current_task()
-        running.add(me)
-        began = time.monotonic()
+        began = None
         error, cancelled = None, False
+        owns_start_lock = False
+
+        def release_start() -> None:
+            nonlocal owns_start_lock
+            if owns_start_lock:
+                owns_start_lock = False
+                start_lock.release()
+
+        def on_step_start(index: int, total: int, step, _) -> None:
+            say(f"{tag} step {index + 1}/{total} {step.id} ({step.type})")
+            release_start()
+
         try:
             try:
+                await start_lock.acquire()
+                owns_start_lock = True
+                running.add(me)
+                began = time.monotonic()
                 await task.run(
-                    on_step_start=lambda i, total, step, _: say(f"{tag} step {i + 1}/{total} {step.id} ({step.type})"),
+                    on_step_start=on_step_start,
                     on_step_complete=lambda i, total, step, _, seconds: say(
                         f"{tag} step {i + 1}/{total} {step.id} done in {seconds:.1f}s"),
                     agent_model=model,
@@ -426,12 +452,14 @@ async def _run_all(
                     await teardown_run(context)
                     raise
                 cancelled = True
-            duration = time.monotonic() - began
-            report = await settle(context, cancelled)
+            finally:
+                release_start()
+            duration = time.monotonic() - began if began is not None else 0.0
+            report = await settle(context, cancelled) if began is not None else TeardownReport()
         finally:
             running.discard(me)
             semaphore.release()
-        run = TaskRun(entry, task, context, error, duration, cancelled=cancelled, torn_down=report)
+        run = TaskRun(entry, task, context, error, duration, cancelled=cancelled, started=began is not None, torn_down=report)
         say(f"{tag} {run.outcome.value} in {run.duration:.1f}s")
         for sandbox_record, why in (report.failed if report else ()):
             say(f"{tag} couldn't tear down {sandbox_record.sandbox_id}: {why}")

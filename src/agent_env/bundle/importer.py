@@ -193,23 +193,29 @@ class _Importer:
         steps = task.to_dict()["steps"]
         registry = get_task_step_registry()
         found = []
+        scope_sites: dict[str, list[RefSite]] = {}
         for location in walk_step_definitions(steps, registry):
             step, cls = location.value, location.step_class
             if cls is None:
                 raise ValueError(f"{location.path}: unknown task step type {step.get('type')!r}")
             pruned = prune(step, cls.field_scopes, self.include_scopes)  # first, so no pruned field is written
-            found.append((location.label, step, cls, pruned, [site for site in ref_sites(cls.entity_refs or (), step)
-                                              if isinstance(site.value, str) and site.value]))
-        sites = [site for *_, step_sites in found for site in step_sites]
-        outputs = _output_names(sites)
-        for site in sites:  # each output, and each step that reads it, takes the output's name
-            if outputs.get(_key(site), site.value) != site.value:
-                site.rewrite(outputs[_key(site)])
-        pins: dict[str, set[int]] = {}  # the versions the task pins each env at
-        for site in sites:
-            if site.ref.kind is EntityKind.ENV and site.version is not None:
-                pins.setdefault(_key(site)[1], set()).add(site.version)
-        for label, step, cls, pruned, step_sites in found:
+            step_sites = [site for site in ref_sites(cls.entity_refs or (), step)
+                          if isinstance(site.value, str) and site.value]
+            found.append((location, pruned, step_sites))
+            scope_sites.setdefault(location.task_path, []).extend(step_sites)
+        scope_outputs = {
+            scope: {_key(site) for site in sites if site.ref.role is RefRole.OUTPUT}
+            for scope, sites in scope_sites.items()
+        }
+        scope_pins: dict[str, dict[str, set[int]]] = {}
+        for scope, sites in scope_sites.items():
+            pins = scope_pins.setdefault(scope, {})
+            for site in sites:
+                if site.ref.kind is EntityKind.ENV and site.version is not None:
+                    pins.setdefault(_key(site)[1], set()).add(site.version)
+        for location, pruned, step_sites in found:
+            label, step, cls = location.label, location.value, location.step_class
+            outputs, pins = scope_outputs[location.task_path], scope_pins[location.task_path]
             where = f"{path}: {label}"
             self.dropped += [Dropped(f"{where}: {at}", why) for at, why in pruned + scrub(step)]
             self._need(where, "step type", TASK_STEPS, cls.type, cls)
@@ -219,6 +225,12 @@ class _Importer:
                 if _key(site) not in outputs:  # the run writes an output again, so it's no entity to write here
                     self._ref(site, f"{where}: {site.path}", pins)
             self._default_agents(step, cls.entity_refs or (), where)
+        reserved = {(kind, name) for kind, folder in _FOLDERS.items() for name in self.taken[_names_of(folder)]}
+        for sites in scope_sites.values():
+            outputs = _output_names(sites, reserved=reserved)
+            for site in sites:
+                if _key(site) in outputs:
+                    site.rewrite(outputs[_key(site)])
         self.files[path] = json.dumps(steps, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         self.tasks.append(ImportedTask(path, task.id, task.version, len(steps)))
         return name
@@ -564,22 +576,25 @@ def _names(value: str, cls: type) -> bool:
     return named is cls
 
 
-def _output_names(sites: list[RefSite]) -> dict[tuple[EntityKind, str], str]:
+def _output_names(
+    sites: list[RefSite], *, reserved: Collection[tuple[EntityKind, str]] = (),
+) -> dict[tuple[EntityKind, str], str]:
     """The name each output takes: as written, or an ``@local`` id's last segment, numbered when it is taken."""
     written = {_key(site) for site in sites if site.ref.role is RefRole.OUTPUT}
-    taken = {_key(site) for site in sites if _key(site) not in written or not site.value.startswith(LOCAL_PREFIX)}
+    taken = {(site.ref.kind, fold(site.value)) for site in sites
+             if _key(site) not in written or not site.value.startswith(LOCAL_PREFIX)} | set(reserved)
     names: dict[tuple[EntityKind, str], str] = {}
     for site in sites:
         if site.ref.role is not RefRole.OUTPUT or _key(site) in names:
             continue
         name = site.value
-        if name.startswith(LOCAL_PREFIX):
-            base = name = name.rsplit("/", 1)[-1]
+        if name.startswith(LOCAL_PREFIX) or (site.ref.kind, fold(name)) in reserved:
+            base = name = name.rsplit("/", 1)[-1] if name.startswith(LOCAL_PREFIX) else name
             n = 1
-            while (site.ref.kind, _nfc(name)) in taken:
+            while (site.ref.kind, fold(name)) in taken:
                 n += 1
                 name = f"{base}-{n}"
-            taken.add((site.ref.kind, _nfc(name)))
+            taken.add((site.ref.kind, fold(name)))
         names[_key(site)] = name
     return names
 

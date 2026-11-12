@@ -1,16 +1,20 @@
 """Embedded task entities resolve, plan and export within their own output scopes."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from agent_env.artifact import FileArtifact
+from agent_env.artifact import FileArtifact, FileArtifactUniverse
+from agent_env.bundle import plan as plan_module
 from agent_env.bundle import BundleError, parse_bundle
 from agent_env.bundle.importer import import_task
 from agent_env.bundle.materialize import materialize
-from agent_env.bundle.plan import plan_bundle
+from agent_env.bundle.parse import BundleKind
+from agent_env.bundle.plan import AgentOverride, plan_bundle, solver_config, solver_step_tree
 from agent_env.bundle.preflight import preflight_run
 from agent_env.bundle.resolve import build_step, resolve_bundle
+from agent_env.bundle.run import _solver_params
 from agent_env.config import configure
 from agent_env.entity.refs import EntityKind
 from agent_env.entity.scopes import FieldScope
@@ -153,6 +157,88 @@ def test_nested_default_agent_reference_is_discovered_before_plan_writes(tmp_pat
         plan = plan_bundle(resolve_bundle(read_bundle(folder)))
 
     assert "@local/tests/nested/solver" in {write.id for write in plan.writes}
+
+
+def test_nested_only_solver_gets_a_scoped_agent_override(tmp_path):
+    children = [
+        {"id": "deploy", "type": "deploy_agent", "a2a_agent_id": "original"},
+        {"id": "prompt", "type": "prompt_agent", "prompt": "Solve.", "depends_on": ["deploy"]},
+    ]
+    folder = bundle_root(tmp_path, [nested_step("outer", children)], {
+        "agents/original/Dockerfile": "FROM scratch\n",
+        "agents/solver/Dockerfile": "FROM scratch\n",
+    })
+
+    with namespace_routing():
+        plan = plan_bundle(resolve_bundle(read_bundle(folder)), agent="solver")
+
+    root = "@local/tests/nested/root"
+    assert plan.agent.steps[root] == ()
+    assert plan.agent.step_trees[root] == {"outer": {"task": {"deploy": None}}}
+    materialization = SimpleNamespace(version_of=lambda kind, id: 4)
+    assert _solver_params(plan, materialization) == {root: {"outer": {"child_step_params": {"task": {
+        "deploy": {"a2a_agent_id": "@local/tests/nested/solver", "a2a_agent_version": 4},
+    }}}}}
+
+
+def test_solver_override_keeps_multiple_embedded_fields_and_same_named_steps_separate(monkeypatch):
+    class TwoGraphsStep(TaskStep):
+        type = "two_graphs"
+        embedded_task_fields = ("left", "right")
+
+    registry = {**get_task_step_registry(), TwoGraphsStep.type: TwoGraphsStep}
+    monkeypatch.setattr(plan_module, "get_task_step_registry", lambda: registry)
+    step = {"id": "outer", "type": TwoGraphsStep.type, **{
+        field: {"id": field, "steps": [
+            {"id": "shared", "type": "deploy_agent", "agent_name": "solver" if field == "left" else "helper",
+             "a2a_agent_id": "original"},
+            {"id": "other", "type": "deploy_agent", "agent_name": "helper" if field == "left" else "solver",
+             "a2a_agent_id": "original"},
+            {"id": "prompt", "type": "prompt_agent", "agent_name": "solver", "prompt": "Solve."},
+        ]} for field in TwoGraphsStep.embedded_task_fields
+    }}
+    tree = solver_step_tree([step])
+    agent = AgentOverride("selected", "chosen", {}, version=7, step_trees={"root": tree})
+
+    overridden = solver_config(step, tree, agent)
+    parameters = _solver_params(SimpleNamespace(agent=agent, writes=[]), SimpleNamespace())
+
+    assert [child["a2a_agent_id"] for child in overridden["left"]["steps"][:2]] == ["chosen", "original"]
+    assert [child["a2a_agent_id"] for child in overridden["right"]["steps"][:2]] == ["original", "chosen"]
+    assert step["left"]["steps"][0]["a2a_agent_id"] == "original"
+    assert parameters == {"root": {"outer": {"child_step_params": {
+        "left": {"shared": {"a2a_agent_id": "chosen", "a2a_agent_version": 7}},
+        "right": {"other": {"a2a_agent_id": "chosen", "a2a_agent_version": 7}},
+    }}}}
+
+
+@pytest.mark.parametrize("relationship", ["siblings", "parent_reader", "child_reader"])
+@pytest.mark.parametrize("artifact_id", ["fixture", "@local/tests/original/fixture"])
+def test_export_does_not_hide_stored_inputs_behind_another_graphs_output(
+    local_stores, tmp_path, relationship, artifact_id,
+):
+    data = tmp_path / "data.json"
+    data.write_text("{}")
+    member = FileArtifact.put(id="fixture-data", description="fixture", file_path=str(data))
+    with namespace_routing():
+        artifact = FileArtifactUniverse.put(id=artifact_id, file_artifacts={"data.json": member})
+    writer = {"id": "snapshot", "type": "snapshot_agent_state", "artifact_id": artifact_id, "prompt_id": "prompt"}
+    reader = {"id": "load", "type": "load_artifact", "artifact_id": artifact_id,
+              "artifact_version": artifact.version, "sandbox_name": "runtime"}
+    steps = {
+        "siblings": [nested_step("writer", [writer]), nested_step("reader", [reader])],
+        "parent_reader": [nested_step("writer", [writer]), reader],
+        "child_reader": [writer, nested_step("reader", [reader])],
+    }[relationship]
+    Task.put(id="export-scopes", steps=[build_step(step) for step in steps])
+
+    with namespace_routing():
+        imported = import_task("export-scopes", tmp_path / "export")
+
+    assert artifact_id in {item.id for item in imported.written}
+    resolved = resolve_bundle(parse_bundle(tmp_path / "export"))
+    task = next(entry for entry in resolved.entries if entry.entry.kind is BundleKind.TASK)
+    assert any(reference.local is not None for reference in task.references if reference.kind is EntityKind.ARTIFACT)
 
 
 def test_nested_deployment_provider_requirements_are_checked_before_any_write(tmp_path, monkeypatch):

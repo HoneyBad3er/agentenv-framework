@@ -78,7 +78,7 @@ from agent_env.task_step.task_steps.verifiers.rubrics_verifier import RubricsVer
 from agent_env.utils.docker.build import DEFAULT_BUILD_PLATFORM, docker_plugin_missing, docker_unreachable
 
 from .parse import BundleError, BundleKind
-from .plan import AgentOverride, Plan
+from .plan import AgentOverride, Plan, solver_config
 from .resolve import BuiltImage, Reference, ReferencedImage, ResolvedEntry, build_step
 
 _SHOWN = 3
@@ -146,15 +146,17 @@ class _Walk:
         self.uses: dict[str, list[tuple[str, str, list[SandboxProvider], Callable[[SandboxProvider], Accepts]]]] = {}
 
     def task(self, task: ResolvedEntry) -> None:
-        solver = self.plan.agent.steps.get(task.entry.id, ()) if self.plan.agent else ()
+        solver = self.plan.agent.step_trees.get(task.entry.id, {}) if self.plan.agent else {}
         self._task_steps(task.config, self.plan.path(task.entry), solver)
 
-    def _task_steps(self, configs: list[dict], task_where: str, solver: tuple[str, ...]) -> None:
+    def _task_steps(self, configs: list[dict], task_where: str, solver: dict) -> None:
+        if self.plan.agent is not None:
+            configs = [solver_config(config, solver, self.plan.agent) for config in configs]
         steps = [build_step(config) for config in configs]
         sandboxes = {step.sandbox_name: step for step in steps if isinstance(step, DeploySandboxTaskStep)}
         for config, step in zip(configs, steps):
             where = f"{task_where}: step {step.id!r}"
-            override = self.plan.agent if step.id in solver else None
+            override = self.plan.agent if step.id in solver and solver[step.id] is None else None
             try:
                 if isinstance(step, DeployEnvTaskStep):
                     self._env(where, step)
@@ -168,8 +170,9 @@ class _Walk:
                     self.default_agent_users.append((where, "names no agent"))
             except ValueError as e:  # a provider that names no backend, or can't be built from its config
                 self._problem(where, str(e))
+            child_solver = solver.get(step.id) if isinstance(solver.get(step.id), dict) else {}
             for field, definition in embedded_tasks(config, type(step)):
-                self._task_steps(definition["steps"], f"{where}: {field}", ())
+                self._task_steps(definition["steps"], f"{where}: {field}", child_solver.get(field, {}))
 
     def finish(self) -> Preflight:
         infra: list[InfraSetup] = []

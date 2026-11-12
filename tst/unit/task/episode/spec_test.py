@@ -8,6 +8,7 @@ from agent_env.task.episode.rules import CHECKS, UNAFFECTED
 from agent_env.task.episode.steps import _EpisodeAgentStep, _EpisodeTurnStep
 from agent_env.task.task import substitute_seed_in_steps
 from agent_env.task_step.registry import _builtin_registry
+from agent_env.task_step.task_step import TaskStep
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
 
@@ -22,6 +23,8 @@ VERIFY = {"id": "verify", "type": "env_outcome_verifier", "env_id": "portsim", "
 BOB = {"id": "bob", "type": "deploy_agent", "agent_name": "bob", "a2a_agent_id": "echo"}
 ASK_BOB = {"id": "ask-bob", "type": "prompt_agent", "agent_name": "bob", "prompt": "Check the plan."}
 SEED = {"week": "3", "port": "Valencia"}
+CHILD_TIMEOUT_SECONDS = 10
+CLEANUP_TIMEOUT_SECONDS = 5
 
 
 def _task(*steps):
@@ -85,6 +88,67 @@ def test_a_task_prompting_several_agents_needs_the_ones_to_play_named():
 ])
 def test_only_a_prompted_agent_can_be_played(trainer_agents, message):
     assert _refusal(_portsim(), trainer_agents=trainer_agents) == message
+
+
+def test_an_outside_agents_nested_steps_are_refused_instead_of_running_a_real_agent():
+    nested = {
+        "id": "nested", "type": "subdag", "child_timeout_seconds": 10, "cleanup_timeout_seconds": 5,
+        "task": {"id": "child", "version": 1, "steps": [
+            {**AGENT, "id": "nested-agent", "env_ids": []},
+            {**PLAY, "id": "nested-play", "depends_on": ["nested-agent"]},
+        ]},
+    }
+
+    refusal = _refusal(_portsim(nested), trainer_agents=["default-agent"])
+
+    assert "step 'nested-agent': outside-agent steps in embedded task graphs aren't supported" in refusal
+    assert "step 'nested-play': outside-agent steps in embedded task graphs aren't supported" in refusal
+
+
+@pytest.mark.parametrize("trainer_agents", [None, ["default-agent"]])
+@pytest.mark.parametrize("child_retry", [False, True])
+def test_child_internal_prompts_and_retries_do_not_share_the_outside_agents_scope(trainer_agents, child_retry):
+    prompt = {**ASK_BOB, "prompt_id": "play"}
+    if child_retry:
+        prompt["retry_config"] = {"retry_from_step_id": "ask-bob"}
+    nested = {
+        "id": "nested", "type": "subdag", "child_timeout_seconds": CHILD_TIMEOUT_SECONDS,
+        "cleanup_timeout_seconds": CLEANUP_TIMEOUT_SECONDS, "task": {"id": "child", "steps": [
+            BOB, prompt,
+            {"id": "grade-child", "type": "rubrics_verifier", "prompt_id": "play", "criteria": [],
+             "use_agent_judge": False, "use_trajectory": True},
+        ]},
+    }
+
+    spec = EpisodeSpec.from_task(_portsim(nested), trainer_agents=trainer_agents)
+
+    assert spec.trainer_agents == ("default-agent",)
+
+
+def test_episode_reads_plugin_embedded_tasks_from_the_serialized_definition():
+    class TaskObjectStep(TaskStep):
+        type = "task_object_plugin"
+        entity_refs = ()
+        embedded_task_fields = ("task",)
+
+        def __init__(self, child_task):
+            super().__init__(id="plugin", version=None)
+            self.child_task = child_task
+
+        def to_dict(self):
+            return {**super().to_dict(), "task": self.child_task.to_dict()}
+
+        @classmethod
+        def from_dict(cls, data):
+            return cls(Task.from_dict(data["task"]))
+
+        async def execute(self, context):
+            return context
+
+    task = _portsim()
+    task.steps.append(TaskObjectStep(_task(BOB, ASK_BOB)))
+
+    assert EpisodeSpec.from_task(task).trainer_agents == ("default-agent",)
 
 
 def test_a_task_prompting_no_agent_has_nothing_to_play():
@@ -212,6 +276,75 @@ def test_a_step_an_outside_player_cant_stand_behind_is_refused_naming_it(extra, 
 
     assert refusal.startswith("task 'dock' can't run as an episode: ")
     assert message in refusal
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize(("extra", "message"), [
+    pytest.param(extra, message, id=name)
+    for name, (extra, _, message) in REFUSED.items()
+    if name in {
+        "deploy_human_agent", "install_agent", "add_skills", "register_agent_triggers", "snapshot_agent_state",
+        "load_artifact", "verify_sandbox", "run_code", "collect from the agent", "trigger executor", "peered",
+        "rubric judged in the agent", "an A2A validator",
+    }
+])
+def test_nested_steps_cannot_bypass_outside_agent_restrictions(extra, message, depth):
+    steps = list(extra)
+    for index in range(depth):
+        steps = [{
+            "id": f"nested-{index}", "type": "subdag", "child_timeout_seconds": CHILD_TIMEOUT_SECONDS,
+            "cleanup_timeout_seconds": CLEANUP_TIMEOUT_SECONDS, "task": {"id": f"child-{index}", "steps": steps},
+        }]
+
+    refusal = _refusal(_portsim(*steps), trainer_agents=["default-agent"])
+
+    assert message in refusal
+
+
+def test_child_manifest_uses_its_own_prompt_scope_even_when_a_parent_turn_has_the_same_id():
+    nested = {
+        "id": "nested", "type": "subdag", "child_timeout_seconds": CHILD_TIMEOUT_SECONDS,
+        "cleanup_timeout_seconds": CLEANUP_TIMEOUT_SECONDS, "task": {"id": "child", "steps": [
+            BOB, {**ASK_BOB, "id": "play", "prompt_id": "play"},
+            {"id": "collect", "type": "collect_artifacts", "env_id": "portsim", "manifest_step_id": "play"},
+        ]},
+    }
+
+    assert EpisodeSpec.from_task(_portsim(nested)).trainer_agents == ("default-agent",)
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_child_can_validate_its_own_internal_agent_without_inheriting_the_parent_agent(depth):
+    steps = [BOB, ASK_BOB, {"id": "validate-bob", "type": "verify_a2a_agent_card", "a2a_agent_id": "echo"}]
+    for index in range(depth):
+        steps = [{
+            "id": f"nested-{index}", "type": "subdag", "child_timeout_seconds": CHILD_TIMEOUT_SECONDS,
+            "cleanup_timeout_seconds": CLEANUP_TIMEOUT_SECONDS, "task": {"id": f"child-{index}", "steps": steps},
+        }]
+
+    assert EpisodeSpec.from_task(_portsim(*steps)).trainer_agents == ("default-agent",)
+
+
+@pytest.mark.parametrize("validator", [
+    {"type": "verify_a2a_install", "agent_name": "default-agent"},
+    {"type": "verify_a2a_agent_config_identity"},
+    {"type": "verify_a2a_peer_agents", "peer_prompt_id": "peer", "expected_token": "ok"},
+])
+@pytest.mark.parametrize("outside_name", ["default-agent", "trainer"])
+def test_child_validator_checks_its_target_before_accepting_an_unrelated_local_agent(validator, outside_name):
+    local_agent = BOB if outside_name == "default-agent" else {**BOB, "agent_name": "default-agent"}
+    nested = {
+        "id": "nested", "type": "subdag", "child_timeout_seconds": CHILD_TIMEOUT_SECONDS,
+        "cleanup_timeout_seconds": CLEANUP_TIMEOUT_SECONDS, "task": {"id": "child", "steps": [
+            local_agent, {"id": "validate", "a2a_agent_id": "echo", **validator},
+        ]},
+    }
+    task = _portsim(nested, agent={**AGENT, "agent_name": outside_name}, play={**PLAY, "agent_name": outside_name})
+
+    if outside_name == "default-agent":
+        assert "step 'validate': validates the task's deployed A2A agent" in _refusal(task)
+    else:
+        assert EpisodeSpec.from_task(task).trainer_agents == (outside_name,)
 
 
 def test_a_user_simulator_played_from_outside_is_refused():

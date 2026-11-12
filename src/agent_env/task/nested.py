@@ -57,11 +57,13 @@ async def _call_nested_store(operation: Callable[[], _T], *, deadline: float) ->
 
 def _initial_context(
     *, parent: TaskStepContext, inputs: dict, execution: StepExecution, generation: int, iteration: int,
-    invocation_name: str | None,
+    invocation_name: str | None, step_params: dict | None,
 ) -> TaskStepContext:
     metadata = copy.deepcopy(inputs)
     metadata["user_overrides"] = copy.deepcopy(parent.metadata.get("user_overrides") or {})
     metadata["user_overrides"].pop("step_params", None)
+    if step_params is not None:
+        metadata["user_overrides"]["step_params"] = copy.deepcopy(step_params)
     metadata["parent_task"] = {
         "instance_id": execution.instance_id,
         "step_id": execution.step_id,
@@ -228,7 +230,7 @@ async def _clean_child(
 async def run_child(
     *, step: TaskStep, context: TaskStepContext, task: dict, inputs: dict, iteration: int,
     child_timeout_seconds: float, cleanup_timeout_seconds: float,
-    invocation_name: str | None = None,
+    invocation_name: str | None = None, step_params: dict | None = None,
 ) -> TaskStepContext:
     execution = current_step_execution()
     if execution.instance_id != context.instance_id or execution.step_id != step.id:
@@ -239,7 +241,7 @@ async def run_child(
     initial = _initial_context(
         parent=context, inputs=inputs, execution=execution,
         generation=parent.child_step_generations.get(step.id, 0), iteration=iteration,
-        invocation_name=invocation_name,
+        invocation_name=invocation_name, step_params=step_params,
     )
     captured_context = initial.to_safe_dict()
     for key in ("workflow_id", "run_group_id"):

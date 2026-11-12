@@ -77,7 +77,9 @@ def _step(plan, step_id):
 def test_an_alias_names_the_agent_the_solver_deploys_and_the_task_stays_as_written(bundle_dir, kit):
     plan = _plan(_bundle(bundle_dir, [DEPLOY, PROMPT]), "solver-x", kit)
 
-    assert plan.agent == AgentOverride("solver-x", SOLVER, {f"{ROOT}/t": ("agent",)})
+    assert plan.agent == AgentOverride(
+        "solver-x", SOLVER, {f"{ROOT}/t": ("agent",)}, step_trees={f"{ROOT}/t": {"agent": None}},
+    )
     assert SOLVER in {write.id for write in plan.writes}
     assert _step(plan, "agent")["a2a_agent_id"] == "theirs" and plan.aliases["solver-x"].target_id == SOLVER
 

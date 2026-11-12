@@ -475,6 +475,7 @@ class Task:
             TaskStepResult,
             TaskStepStatus,
             record_step_complete,
+            record_task_failure,
             register_task_instance,
             seed_task_instance_context,
         )
@@ -541,8 +542,18 @@ class Task:
             if instance:
                 context.instance_id = instance.instance_id
                 state.epoch = instance.attempt_epoch
-                await call_store(partial(seed_task_instance_context, instance.instance_id, copy.deepcopy(context),
-                                         attempt_epoch=instance.attempt_epoch), deadline=current_store_deadline())
+                try:
+                    await call_store(partial(seed_task_instance_context, instance.instance_id, copy.deepcopy(context),
+                                             attempt_epoch=instance.attempt_epoch), deadline=current_store_deadline())
+                except Exception as error:
+                    try:
+                        with store_deadline(asyncio.get_running_loop().time() + resource_checkpoint_timeout_seconds):
+                            await record_task_failure(
+                                instance.instance_id, None, context, error, self._utc_now_str(), state.epoch,
+                            )
+                    except Exception as recording_error:
+                        error.add_note(f"Recording initialization failure also failed: {type(recording_error).__name__}")
+                    raise
             return instance
 
         initializing = asyncio.create_task(initialize_instance())

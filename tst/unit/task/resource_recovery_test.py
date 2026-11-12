@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_env.config import configure
+from agent_env.config import configure, get_config
 from agent_env.providers.sandbox_providers.sandbox import Sandbox
 from agent_env.providers.sandbox_providers.sandbox_provider import SandboxProvider
 from agent_env.runner import store as run_store
@@ -19,8 +19,12 @@ from agent_env.runner.local_runner import LocalRunner
 from agent_env.runner.runner import RunStatus
 from agent_env.store import LocalSqliteDocumentStore
 from agent_env.task import Task
-from agent_env.task.child_store import ChildCleanupState, get_child_invocation_store
+from agent_env.task import teardown as teardown_api
+from agent_env.task.child_store import TASK_CHILD_INVOCATIONS_COLLECTION, ChildCleanupState, get_child_invocation_store
 from agent_env.task.execution import TaskLifecycleError
+from agent_env.task.resources import record_resource_context
+from agent_env.task.store import get_task_instance_store
+from agent_env.task.teardown import teardown_run
 from agent_env.task_step.context import DeployedSandbox, TaskStepContext
 from agent_env.task_step.task_step import RetryConfig, TaskStep
 from agent_env.task_step.task_steps.subdag import SubDAGTaskStep
@@ -210,6 +214,128 @@ async def test_failed_step_resource_is_cleaned_even_though_its_domain_context_wa
     assert log_path.read_text().splitlines() == ["failed-box"]
     [invocation] = get_child_invocation_store().list_for_parent(context.instance_id)
     assert invocation.cleanup_state is ChildCleanupState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["children", "inventory"])
+async def test_store_discovery_failure_does_not_prevent_known_resource_cleanup(recovery_config, monkeypatch, failed_read):
+    _, log_path, _ = recovery_config
+    context = TaskStepContext()
+    await Task(id="live-owner", version=1, steps=[
+        RecoveryStep(id="known", resource_id="known-box"),
+    ]).run(context=context)
+    documents = get_config().get_document_store()
+    query = documents.query
+    original = ConnectionError("document store unavailable")
+
+    def query_documents(collection, *args, **kwargs):
+        if collection == TASK_CHILD_INVOCATIONS_COLLECTION:
+            raise original
+        return query(collection, *args, **kwargs)
+
+    async def unavailable_inventory(*args, **kwargs):
+        raise original
+
+    with monkeypatch.context() as failure:
+        if failed_read == "children":
+            failure.setattr(documents, "query", query_documents)
+        else:
+            failure.setattr(teardown_api, "load_resource_context", unavailable_inventory)
+        with pytest.raises(ConnectionError) as caught:
+            await teardown_run(context, timeout=TEST_BUDGET_SECONDS)
+
+    assert caught.value is original
+    assert log_path.read_text().splitlines() == ["known-box"]
+    report = await teardown_run(TaskStepContext(instance_id=context.instance_id), timeout=TEST_BUDGET_SECONDS)
+    assert not report.still_up
+    assert log_path.read_text().splitlines() == ["known-box"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_combines_live_and_recovered_resources_without_terminating_either_twice(recovery_config):
+    _, log_path, _ = recovery_config
+    context = await Task(id="partial-owner", version=1, steps=[
+        RecoveryStep(id="known", resource_id="known-box"),
+        RecoveryStep(id="recovered", resource_id="recovered-box"),
+    ]).run()
+    context.deployed_sandboxes = context.deployed_sandboxes[:1]
+
+    report = await teardown_run(context, timeout=TEST_BUDGET_SECONDS)
+
+    assert {sandbox.sandbox_id for sandbox in report.terminated} == {"known-box", "recovered-box"}
+    assert not report.still_up
+    assert log_path.read_text().splitlines() == ["known-box", "recovered-box"]
+
+
+@pytest.mark.asyncio
+async def test_restored_context_skips_termination_confirmed_only_in_resource_inventory(recovery_config):
+    _, log_path, _ = recovery_config
+    context = await Task(id="restored-owner", version=1, steps=[
+        RecoveryStep(id="known", resource_id="known-box"),
+    ]).run()
+    instance = get_task_instance_store().get(context.instance_id)
+    restored = TaskStepContext.from_dict(instance.context)
+    restored.instance_id = context.instance_id
+
+    await teardown_run(context, timeout=TEST_BUDGET_SECONDS)
+    report = await teardown_run(restored, timeout=TEST_BUDGET_SECONDS)
+
+    assert not report.still_up
+    assert log_path.read_text().splitlines() == ["known-box"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_changelog_is_drained_before_its_committed_resource_is_terminated(recovery_config, monkeypatch):
+    _, log_path, _ = recovery_config
+    context = await Task(id="checkpointed-changelog", version=1, steps=[
+        RecoveryStep(id="agent", resource_id="agent-box"),
+    ]).run()
+    instance = get_task_instance_store().get(context.instance_id)
+    context.metadata["agent_changelog"] = [dict(STAGED_CHANGELOG_ENTRY)]
+    await record_resource_context(
+        context, attempt_epoch=instance.attempt_epoch,
+        deadline=asyncio.get_running_loop().time() + TEST_BUDGET_SECONDS,
+    )
+    restored = TaskStepContext.from_dict(instance.context)
+    restored.instance_id = context.instance_id
+
+    async def collect(namespaces):
+        if list(namespaces):
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write("drained-changelog\n")
+        return []
+
+    monkeypatch.setattr(teardown_api, "drain_all", collect)
+    await teardown_run(restored, timeout=TEST_BUDGET_SECONDS)
+    assert log_path.read_text().splitlines() == ["drained-changelog", "agent-box"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cleanup_does_not_start_additional_provider_calls(recovery_config, monkeypatch):
+    context = await Task(id="cancelled-cleanup", version=1, steps=[
+        RecoveryStep(id="known", resource_id="known-box"),
+        RecoveryStep(id="recovered", resource_id="recovered-box"),
+    ]).run()
+    context.deployed_sandboxes = context.deployed_sandboxes[:1]
+    entered = asyncio.Event()
+    attempts = []
+
+    async def terminate(self, sandbox_id):
+        attempts.append(sandbox_id)
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(RecoveryProvider, "terminate_sandbox", terminate)
+    cleaning = asyncio.create_task(teardown_run(context, timeout=TEST_BUDGET_SECONDS))
+    try:
+        async with asyncio.timeout(TEST_BUDGET_SECONDS):
+            await entered.wait()
+        before_cancel = list(attempts)
+    finally:
+        cleaning.cancel()
+        report = await cleaning
+    assert attempts == before_cancel
+    assert {resource.sandbox_id for resource in report.left} == {"known-box", "recovered-box"}
 
 
 @pytest.mark.asyncio

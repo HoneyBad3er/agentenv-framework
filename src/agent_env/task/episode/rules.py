@@ -7,12 +7,15 @@ Plugin step types aren't inspected.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from agent_env.task.task import Task
+from agent_env.task_step.task_step import TaskStep
+from agent_env.task_step.traversal import embedded_tasks
+
 if TYPE_CHECKING:
-    from agent_env.task_step.task_step import TaskStep
     from agent_env.task_step.task_steps.collect_artifacts import CollectArtifactsTaskStep
     from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
     from agent_env.task_step.task_steps.peer_agents import PeerAgentsTaskStep
@@ -23,28 +26,42 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Outside:
-    """The agents played from outside, and their prompts by step id, each with its prompt id."""
+    """Outside agent names, their graph-local prompt ids, and this graph's declared deployments."""
 
     agents: frozenset[str]
     prompts: dict[str, str]
+    local_agents: frozenset[str]
 
 
-def problems(steps: list[TaskStep], outside: list[str]) -> list[str]:
+def episode_steps(steps: list[TaskStep], *, nested: bool = False) -> Iterator[tuple[TaskStep, bool]]:
+    for step in steps:
+        yield step, nested
+        for _, definition in embedded_tasks(step.to_dict(), type(step)):
+            yield from episode_steps(Task.from_dict(definition).steps, nested=True)
+
+
+def problems(steps: list[TaskStep], outside: list[str], *, nested: bool = False) -> list[str]:
     """Why each outside agent, and each step, can't run with those agents played from outside; empty when it can."""
     found = []
-    for name in outside:
+    for name in outside if not nested else ():
         deploys = [step for step in steps if step.type == "deploy_agent" and step.agent_name == name]
         if len(deploys) != 1:
             found.append(f"agent {name!r} is played from outside, so it needs exactly one deploy_agent step, "
                          f"not {len(deploys)}")
     scope = Outside(frozenset(outside), {
         step.id: step.prompt_id for step in steps if step.type == "prompt_agent" and step.agent_name in outside
-    })
+    }, frozenset(
+        step.agent_name for step in steps if step.type in ("deploy_agent", "install_agent", "deploy_human_agent")
+    ))
     for step in steps:
-        why = ["retry_config can replay an outside turn"] if step.retry_config is not None else []
+        why = ["retry_config can replay an outside turn"] if not nested and step.retry_config is not None else []
+        if nested and step.type in ("deploy_agent", "prompt_agent") and step.agent_name in outside:
+            why.append("outside-agent steps in embedded task graphs aren't supported")
         if check := CHECKS.get(step.type):
             why += check(step, scope)
         found.extend(f"step {step.id!r}: {reason}" for reason in why)
+        for _, definition in embedded_tasks(step.to_dict(), type(step)):
+            found.extend(problems(Task.from_dict(definition).steps, outside, nested=True))
     return found
 
 
@@ -89,8 +106,18 @@ def _needs_the_agent(step: TaskStep, outside: Outside) -> list[str]:
     return [f"{step.type} needs {step.agent_name!r} as a real agent, and it is played from outside"]
 
 
-def _validates_an_agent(step: TaskStep, outside: Outside) -> list[str]:
+def _validates_an_agent(step: TaskStep, outside: Outside, *, agent_name: str | None = None) -> list[str]:
+    if agent_name not in outside.agents and outside.local_agents and outside.local_agents.isdisjoint(outside.agents):
+        return []
     return ["validates the task's deployed A2A agent, and an episode plays one from outside"]
+
+
+def _validates_named_agent(step: TaskStep, outside: Outside) -> list[str]:
+    return _validates_an_agent(step, outside, agent_name=step.agent_name)
+
+
+def _validates_default_agent(step: TaskStep, outside: Outside) -> list[str]:
+    return _validates_an_agent(step, outside, agent_name=TaskStep.DEFAULT_AGENT_NAME)
 
 
 def _collect_artifacts(step: CollectArtifactsTaskStep, outside: Outside) -> list[str]:
@@ -139,9 +166,11 @@ CHECKS: dict[str, Callable[..., list[str]]] = {
     "register_env_triggers": _register_env_triggers,
     "peer_agents": _peer_agents,
     "rubrics_verifier": _rubrics_verifier,
+    "verify_a2a_install": _validates_named_agent,
+    "verify_a2a_agent_config_identity": _validates_default_agent,
+    "verify_a2a_peer_agents": _validates_default_agent,
     **dict.fromkeys((
-        "verify_a2a_agent_card", "verify_a2a_agent_config_identity", "verify_a2a_agent_mcp", "verify_a2a_core_protocol",
-        "verify_a2a_install", "verify_a2a_modalities", "verify_a2a_peer_agents", "verify_a2a_role",
+        "verify_a2a_agent_card", "verify_a2a_agent_mcp", "verify_a2a_core_protocol", "verify_a2a_modalities", "verify_a2a_role",
         "verify_a2a_skill_config", "verify_a2a_snapshot", "verify_a2a_system_prompt", "verify_a2a_trajectory",
     ), _validates_an_agent),
 }

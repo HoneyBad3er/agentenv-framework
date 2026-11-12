@@ -42,7 +42,7 @@ from ._fs import with_article
 from .authoring import AuthoringContext, staged_build_context
 from .ledger import Ledger, locked_ids, materializing
 from .parse import BundleError, BundleKind
-from .plan import Plan, Write, artifact_writer, env_writer, unpinned_store_refs
+from .plan import Plan, Write, artifact_writer, env_writer, solver_config, unpinned_store_refs
 from .resolve import BuiltImage, BundleImage, ReferencedImage, build_step
 
 @dataclass(frozen=True)
@@ -333,11 +333,11 @@ def _preflight(plan: Plan, write: Write, task: Task,
     A step reading one of the task's own outputs is skipped too, and not listed: the output only exists once the
     task runs. A step the solver deploys or installs at is checked for the agent the run gives it (``Plan.agent``)."""
     outputs = {output.id for output in write.source.outputs}
-    solver = plan.agent.steps.get(write.id, ()) if plan.agent is not None else ()
+    solver = plan.agent.step_trees.get(write.id, {}) if plan.agent is not None else {}
     problems, unchecked = [], []
     for config, step in zip(write.source.config, task.steps):
-        if step.id in solver:
-            config = {**config, "a2a_agent_id": plan.agent.agent_id, "a2a_agent_version": plan.agent.version}
+        if plan.agent is not None:
+            config = solver_config(config, solver, plan.agent)
             step = build_step(config)
         problems.extend(step.config_problems())
         reads = _reads(config)

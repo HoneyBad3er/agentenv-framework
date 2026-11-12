@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -25,12 +26,14 @@ from agent_env.entity.refs import EntityRef
 from agent_env.store import Filter
 from agent_env.store.routing import namespace_routing
 from agent_env.task import Task
+from agent_env.task.interrupts import Interrupts
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_step import TaskStep
 from tst.unit.bundle._support import layout, local_store, plan_of
 
 ROOT = "@local/~/triage"
 DRY_RUN = "Dry run: nothing is written or run.\n"
+RUN_START_TIMEOUT_SECONDS = 5
 
 
 class _Scored(TaskStep):
@@ -248,6 +251,138 @@ def test_the_model_and_sandbox_reach_each_run_and_one_invocation_shares_a_run_gr
     assert first[0].metadata["run_group_id"] == first[1].metadata["run_group_id"]
     assert _Scored.seen[2].metadata["run_group_id"] != first[0].metadata["run_group_id"]
     assert "user_overrides" not in _Scored.seen[2].metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_roots", [1, 2])
+async def test_slow_registration_preserves_start_order_without_serializing_task_execution(
+    local_stores, monkeypatch, second_roots,
+):
+    first_initializing, release_registration, release_first_step, second_started = (asyncio.Event() for _ in range(4))
+    initialized = []
+    executed = []
+    run_task = Task.run
+
+    class CaptureStep(TaskStep):
+        type = "capture_start"
+        entity_refs = ()
+
+        async def execute(self, context):
+            executed.append(self.id)
+            if self.id == "first":
+                await release_first_step.wait()
+            elif len(executed) == second_roots + 1:
+                second_started.set()
+            return context
+
+    async def delay_registration(self, *args, **kwargs):
+        initialized.append(self.id)
+        if self.id == "first":
+            first_initializing.set()
+            await release_registration.wait()
+        return await run_task(self, *args, **kwargs)
+
+    monkeypatch.setattr(Task, "run", delay_registration)
+    tasks = [
+        Task(id="first", version=None, steps=[CaptureStep(id="first", version=None)]),
+        Task(id="second", version=None, steps=[
+            CaptureStep(id=f"second-{index}", version=None, depends_on=[]) for index in range(second_roots)
+        ]),
+    ]
+    running = asyncio.create_task(run_module._run_all(
+        plan=SimpleNamespace(path=lambda entry: entry.id),
+        to_run=[(SimpleNamespace(id=task.id), task) for task in tasks], model=None, overrides={}, step_params={},
+        keep=True, say=lambda message: None, interrupts=Interrupts(),
+    ))
+    try:
+        async with asyncio.timeout(RUN_START_TIMEOUT_SECONDS):
+            await first_initializing.wait()
+            assert initialized == ["first"]
+            assert executed == []
+            release_registration.set()
+            await second_started.wait()
+            assert executed == ["first", *(f"second-{index}" for index in range(second_roots))]
+            assert not release_first_step.is_set()
+    finally:
+        release_registration.set()
+        release_first_step.set()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_failure_before_the_first_step_releases_the_next_bundle_task(local_stores, monkeypatch):
+    run_task = Task.run
+    failure = RuntimeError("initialization failed")
+    executed = []
+
+    class CaptureStep(TaskStep):
+        type = "capture_after_failure"
+        entity_refs = ()
+
+        async def execute(self, context):
+            executed.append(self.id)
+            return context
+
+    async def fail_initialization(self, *args, **kwargs):
+        if self.id == "first":
+            raise failure
+        return await run_task(self, *args, **kwargs)
+
+    monkeypatch.setattr(Task, "run", fail_initialization)
+    tasks = [Task(id=name, version=None, steps=[CaptureStep(id=name, version=None)]) for name in ("first", "second")]
+    async with asyncio.timeout(RUN_START_TIMEOUT_SECONDS):
+        results = await run_module._run_all(
+            plan=SimpleNamespace(path=lambda entry: entry.id),
+            to_run=[(SimpleNamespace(id=task.id), task) for task in tasks], model=None, overrides={}, step_params={},
+            keep=True, say=lambda message: None, interrupts=Interrupts(),
+        )
+
+    assert executed == ["second"]
+    assert results[0].error is failure
+    assert results[1].error is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tasks_waiting_for_start_or_capacity_are_reported_as_not_started(local_stores, monkeypatch):
+    initializing = asyncio.Event()
+    called = []
+    messages = []
+
+    async def slow_initialization(self, **kwargs):
+        called.append(self.id)
+        initializing.set()
+        await asyncio.Event().wait()
+
+    class CancelDuringInitialization(Interrupts):
+        async def gather(self, runs, on_signal):
+            futures = [asyncio.create_task(run) for run in runs]
+            try:
+                await initializing.wait()
+                self.count = 1
+                on_signal(self.count)
+            finally:
+                for future in futures:
+                    future.cancel()
+                await asyncio.gather(*futures, return_exceptions=True)
+            return futures
+
+    monkeypatch.setattr(Task, "run", slow_initialization)
+    tasks = [
+        Task(id=f"task-{index}", version=None, steps=[_Scored(id="score", version=None)])
+        for index in range(run_module.MAX_CONCURRENT_RUNS + 1)
+    ]
+    async with asyncio.timeout(RUN_START_TIMEOUT_SECONDS):
+        results = await run_module._run_all(
+            plan=SimpleNamespace(path=lambda entry: entry.id),
+            to_run=[(SimpleNamespace(id=task.id), task) for task in tasks], model=None, overrides={}, step_params={},
+            keep=False, say=messages.append, interrupts=CancelDuringInitialization(),
+        )
+
+    assert called == [tasks[0].id]
+    assert [run.started for run in results] == [True, *([False] * run_module.MAX_CONCURRENT_RUNS)]
+    assert all(run.cancelled for run in results)
+    assert all(run.duration == 0 and run.instance_id is None for run in results[1:])
+    assert "Cancelling: tearing down 1 run (Ctrl-C again to stop now)" in messages
 
 
 def test_the_user_and_judge_models_reach_each_run_as_overrides_beside_the_sandbox(bundle_dir):

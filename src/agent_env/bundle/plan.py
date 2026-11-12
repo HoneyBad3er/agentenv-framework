@@ -54,7 +54,7 @@ from agent_env.store.routing import namespace_routing_enabled
 from agent_env.task import Task
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_step import TaskStep
-from agent_env.task_step.traversal import walk_step_definitions
+from agent_env.task_step.traversal import embedded_tasks, walk_step_definitions
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.install_agent import InstallAgentTaskStep
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
@@ -131,6 +131,9 @@ class AliasUse:
         return self.alias if self.store_version is not None else self.target_id
 
 
+SolverStepTree = dict[str, "dict[str, SolverStepTree] | None"]
+
+
 @dataclass(frozen=True)
 class AgentOverride:
     """The agent a run deploys for the solver in place of the one each task names: at each step that deploys or
@@ -140,6 +143,7 @@ class AgentOverride:
     agent_id: str
     steps: Mapping[str, tuple[str, ...]]
     version: int | None = None  # the store's version the plan read; None for an agent the run writes
+    step_trees: Mapping[str, SolverStepTree] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -336,15 +340,16 @@ class _Planner:
             if (problem := self.unpulled.get((ref.kind, ref.id, None)) or self._unstored(ref)) is not None:
                 self.problems.append(f"{where}: {problem}")
                 return None
-        steps = {}
+        steps, step_trees = {}, {}
         for index, entry in enumerate(self.entries):
-            if entry.entry.kind is BundleKind.TASK and (solver := solver_steps(entry.config)):
-                steps[entry.entry.id] = solver
+            if entry.entry.kind is BundleKind.TASK and (tree := solver_step_tree(entry.config)):
+                steps[entry.entry.id] = solver_steps(entry.config)
+                step_trees[entry.entry.id] = tree
                 self._replace(index, replace(entry, references=(*entry.references, ref)))
         if not steps:
             self.problems.append(f"{where}: no step in this bundle's tasks prompts an agent, so none deploys a solver")
             return None
-        return AgentOverride(name, ref.local.id if ref.local is not None else ref.id, steps)
+        return AgentOverride(name, ref.local.id if ref.local is not None else ref.id, steps, step_trees=step_trees)
 
     def _unstored(self, ref: Reference) -> str | None:
         """Why the store has no agent ``ref`` names, a store ref, or None when it has one or ``ref`` is local."""
@@ -1069,6 +1074,41 @@ def solver_steps(steps: Any) -> tuple[str, ...]:
     return tuple(step["id"] for step in steps if isinstance(step, dict) and isinstance(step.get("id"), str)
                  and step.get("type") in (DeployAgentTaskStep.type, InstallAgentTaskStep.type)
                  and (step.get("agent_name") or TaskStep.DEFAULT_AGENT_NAME) in prompted)
+
+
+def solver_step_tree(steps: Any) -> SolverStepTree:
+    """Solver steps by graph scope: None marks a deployment, children are keyed by embedded task field."""
+    tree = {}
+    solvers = set(solver_steps(steps))
+    registry = get_task_step_registry()
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("id"), str):
+            continue
+        if step["id"] in solvers:
+            tree[step["id"]] = None
+        cls = registry.get(step.get("type"))
+        if cls is None:
+            continue
+        children = {}
+        for task_field, definition in embedded_tasks(step, cls):
+            if child := solver_step_tree(definition["steps"]):
+                children[task_field] = child
+        if children:
+            tree[step["id"]] = children
+    return tree
+
+
+def solver_config(step: dict, tree: SolverStepTree, agent: AgentOverride) -> dict:
+    """One step config with the solver override applied at its own graph scope, leaving the stored task unchanged."""
+    config = copy.deepcopy(step)
+    step_id = config.get("id")
+    if step_id in tree and tree[step_id] is None:
+        config.update(a2a_agent_id=agent.agent_id, a2a_agent_version=agent.version)
+    if isinstance(tree.get(step_id), dict) and (cls := get_task_step_registry().get(config.get("type"))) is not None:
+        for task_field, definition in embedded_tasks(config, cls):
+            child_tree = tree[step_id].get(task_field, {})
+            definition["steps"] = [solver_config(child, child_tree, agent) for child in definition["steps"]]
+    return config
 
 
 def _leaves_an_agent_unset(task: ResolvedEntry) -> bool:

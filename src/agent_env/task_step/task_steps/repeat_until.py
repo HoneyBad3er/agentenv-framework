@@ -95,6 +95,7 @@ class RepeatUntilTaskStep(SubDAGTaskStep):
                 inputs={**base_inputs, **feedback}, iteration=iteration,
                 child_timeout_seconds=self.child_timeout_seconds,
                 cleanup_timeout_seconds=self.cleanup_timeout_seconds,
+                step_params=self.step_param_overrides(context).get("child_step_params", {}).get("task"),
             )
             if self.until_key not in child_context.metadata:
                 raise ValueError(f"until_key metadata {self.until_key!r} is missing from the child task")

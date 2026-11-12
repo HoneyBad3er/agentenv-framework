@@ -94,6 +94,8 @@ class ProbeStep(TaskStep):
             context.metadata[self.key] += 1
             if state.calls[self.id] == 1:
                 raise RuntimeError("child failed after changing uncommitted context")
+        elif self.action == "override":
+            context.metadata[self.key] = self.step_param_overrides(context)
         elif self.action == "resource":
             resource_id = f"{self.id}-{state.calls[self.id]}"
             context.deployed_sandboxes.append(DeployedSandbox(
@@ -222,6 +224,24 @@ async def test_subdag_isolates_parent_context_and_records_child_output_handoff(n
     assert replayed["metadata"]["result"] == {"input": "original", "child_mutation": "echo"}
     assert any(path.startswith("context.metadata.result") for path in changes.sets)
     assert not any("child_only" in path or "payload" in path for path in changes.sets)
+
+
+@pytest.mark.asyncio
+async def test_subdag_delivers_only_its_own_scoped_step_overrides(nested_state: ProbeState) -> None:
+    child = child_task(ProbeStep(id="child-write", action="override", key="answer"))
+    task = Task(id="override-parent", version=1, steps=[
+        subdag_step(child, output_bindings={"result": "answer"}),
+    ])
+    context = TaskStepContext(metadata={"user_overrides": {"step_params": {
+        "nested": {"a2a_agent_id": "outer-only", "child_step_params": {"task": {
+            "child-write": {"a2a_agent_id": "nested-agent", "a2a_agent_version": 4},
+        }}},
+        "child-write": {"a2a_agent_id": "wrong-outer-scope"},
+    }}})
+
+    result = await task.run(context=context)
+
+    assert result.metadata["result"] == {"a2a_agent_id": "nested-agent", "a2a_agent_version": 4}
 
 
 @pytest.mark.asyncio
